@@ -1137,12 +1137,13 @@ fn growth(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, a: &Agent, p: &Palette
     if n == 1 {
         column(0, points[0].pct);
     }
+    let mut memo = crate::terminal::FamilyMemo::default();
     let colors: Vec<_> = (0..cols)
         .map(|col| {
             let point =
                 ((col * 2) as f64 / (pw - 1).max(1) as f64 * (n - 1) as f64).round() as usize;
             let point = &points[point.min(n - 1)];
-            crate::terminal::family(&point.model, Some(&point.provider))
+            memo.family(&point.model, Some(&point.provider))
         })
         .collect();
     for row in 0..h {

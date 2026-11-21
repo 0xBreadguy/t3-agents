@@ -192,12 +192,6 @@ fn wanted(raw: &[u8], escaped: bool, keys: &[&[u8]]) -> Option<usize> {
 
 struct Cursor<'a> { b: &'a [u8], i: usize, cut: bool }
 
-const ONES: u64 = 0x0101_0101_0101_0101;
-const HIGHS: u64 = 0x8080_8080_8080_8080;
-
-// Whether any byte of `word` is zero (exact; it may misplace which one, never miss one).
-const fn has_zero(word: u64) -> bool { word.wrapping_sub(ONES) & !word & HIGHS != 0 }
-
 impl<'a> Cursor<'a> {
     // The end of the text reads as NUL: SQLite stops at a NUL, and neither is valid inside
     // a document, so both end it the same way.
@@ -218,22 +212,18 @@ impl<'a> Cursor<'a> {
         if self.peek() == 0 && !self.cut { Ok(()) } else { Err(Fault::NotStrict) }
     }
 
-    /// At an opening quote: past the closing one, and whether there was an escape. Eight bytes
-    /// at a time to the next quote, backslash or NUL; nothing is copied.
+    /// At an opening quote: past the closing one, and whether there was an escape. A vectorized
+    /// search (`memchr`, chosen at run time) to the next quote, backslash or NUL; nothing is copied.
     fn string(&mut self) -> Result<bool, Fault> {
         let b = self.b;
         let mut i = self.i + 1;
         let mut escaped = false;
         loop {
-            while let Some(chunk) = b.get(i..i + 8) {
-                let word = u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
-                if has_zero(word ^ (b'"' as u64 * ONES)) || has_zero(word ^ (b'\\' as u64 * ONES)) || has_zero(word) { break; }
-                i += 8;
-            }
-            match b.get(i) {
-                None | Some(0) => return Err(Fault::NotStrict),
-                Some(b'"') => { self.i = i + 1; return Ok(escaped); }
-                Some(b'\\') => {
+            i += memchr::memchr3(b'"', b'\\', 0, &b[i..]).ok_or(Fault::NotStrict)?;
+            match b[i] {
+                0 => return Err(Fault::NotStrict),
+                b'"' => { self.i = i + 1; return Ok(escaped); }
+                b'\\' => {
                     escaped = true;
                     match b.get(i + 1) {
                         Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => i += 2,
@@ -241,7 +231,7 @@ impl<'a> Cursor<'a> {
                         _ => return Err(Fault::NotStrict),
                     }
                 }
-                Some(_) => i += 1,
+                _ => unreachable!(),
             }
         }
     }
@@ -1901,6 +1891,136 @@ mod tests {
             "SELECT t3_call('{}', 'x', 1, 'b')", "SELECT t3_call('{}', 'x', '0', 1)", "SELECT t3_call('{\"a\":\"never read', 'x', 0, 1.5)"] {
             let error = db.query_row(sql, [], |r| r.get::<_, Option<String>>(0)).unwrap_err().to_string();
             assert!(plain(&error), "{error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod string_scan {
+    use super::*;
+
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    const fn has_zero(word: u64) -> bool { word.wrapping_sub(ONES) & !word & HIGHS != 0 }
+
+    /// `Cursor::string` as 1.4.0 had it.
+    fn old(c: &mut Cursor<'_>) -> Result<bool, Fault> {
+        let b = c.b;
+        let mut i = c.i + 1;
+        let mut escaped = false;
+        loop {
+            while let Some(chunk) = b.get(i..i + 8) {
+                let word = u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
+                if has_zero(word ^ (b'"' as u64 * ONES)) || has_zero(word ^ (b'\\' as u64 * ONES)) || has_zero(word) { break; }
+                i += 8;
+            }
+            match b.get(i) {
+                None | Some(0) => return Err(Fault::NotStrict),
+                Some(b'"') => { c.i = i + 1; return Ok(escaped); }
+                Some(b'\\') => {
+                    escaped = true;
+                    match b.get(i + 1) {
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => i += 2,
+                        Some(b'u') if b.get(i + 2..i + 6).is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) => i += 6,
+                        _ => return Err(Fault::NotStrict),
+                    }
+                }
+                Some(_) => i += 1,
+            }
+        }
+    }
+
+    // Xorshift64* with a fixed seed so failures can be reproduced.
+    struct Gen(u64);
+
+    impl Gen {
+        fn below(&mut self, limit: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            ((self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as usize) % limit
+        }
+    }
+
+    fn compare(buf: &[u8], at: usize, skew: usize, cut: bool) {
+        let mut padded = vec![0x55; skew];
+        padded.extend_from_slice(buf);
+        let b = &padded[skew..];
+        let mut before = Cursor { b, i: at, cut };
+        let mut after = Cursor { b, i: at, cut };
+        let expected = old(&mut before);
+        let actual = after.string();
+        assert_eq!(
+            (actual, after.i), (expected, before.i),
+            "buffer {buf:?}, opening quote {at}, skew {skew}, cut {cut}",
+        );
+    }
+
+    // Escapes and their tails: valid and invalid, near the end and in the middle.
+    const TAILS: [&[u8]; 14] = [b"\\\"", b"\\\\", b"\\/", b"\\b", b"\\n", b"\\u00e9", b"\\uD83D", b"\\u12G4", b"\\u12", b"\\x", b"\\", b"\\\\0", b"\\u", b"\\u0000"];
+
+    #[test]
+    fn vectorized_string_scan_matches_the_eight_byte_scan() {
+        // 1. Every position of a quote, backslash or NUL (alone, and with a second one after it),
+        //    in texts of every length to 72 (past two 32-byte blocks), at pads 0 to 3, every skew
+        //    to 33 in steps, with and without `cut`.
+        for pad in 0..4usize {
+            for len in 0..=72usize {
+                for first in 0..=len {
+                    for &x in &[b'"', b'\\', 0u8, b'a'] {
+                        for second in (first..=len).step_by(7).chain([len]) {
+                            for &y in &[b'"', b'\\', 0u8] {
+                                let mut buf = vec![0x55u8; pad];
+                                buf.push(b'"');
+                                let mut text = vec![b'a'; len];
+                                if first < len { text[first] = x; }
+                                if second < len && second > first { text[second] = y; }
+                                buf.extend_from_slice(&text);
+                                let skew = (first + second + pad) % 33;
+                                compare(&buf, pad, skew, first % 2 == 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 2. An escape (every tail above) at every position of every length to 72, and a text
+        //    cut off right after it.
+        for len in 0..=72usize {
+            for at in 0..=len {
+                for tail in TAILS {
+                    for cut_after in [false, true] {
+                        let mut buf = vec![b'"'];
+                        buf.extend(std::iter::repeat(b'a').take(at));
+                        buf.extend_from_slice(tail);
+                        if !cut_after { buf.extend(std::iter::repeat(b'b').take(len - at)); buf.push(b'"'); }
+                        let skew = (at + len) % 33;
+                        compare(&buf, 0, skew, cut_after);
+                    }
+                }
+            }
+        }
+        // 3. Random buffers over an alphabet weighted toward the interesting bytes.
+        let mut g = Gen(0x9e37_79b9_7f4a_7c15);
+        const PLAIN: &[u8] = b"aaaz ";
+        const SPECIAL: &[u8] = b"\"\\\\\0u0fFgn/\t\n\x7f\x80\xc3\xff\x01";
+        for _ in 0..300_000 {
+            let pad = g.below(40);
+            let len = g.below(100);
+            let mut buf = vec![0x55; pad];
+            buf.push(b'"');
+            let density = g.below(4);
+            for _ in 0..len {
+                let byte = if g.below(16) <= density {
+                    SPECIAL[g.below(SPECIAL.len())]
+                } else {
+                    PLAIN[g.below(PLAIN.len())]
+                };
+                buf.push(byte);
+            }
+            if g.below(2) == 0 { buf.push(b'"'); }
+            let skew = g.below(64);
+            compare(&buf, pad, skew, g.below(2) == 0);
         }
     }
 }

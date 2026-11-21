@@ -51,6 +51,7 @@ pub struct Host {
     /// When set, a due refresh copies this instead of probing the filesystem.
     pub headroom_inject: Option<Vec<crate::headroom::WarningVolume>>,
     last_headroom: f64,
+    initial_reader: Option<live::Reader>,
 }
 
 impl Host {
@@ -81,7 +82,17 @@ impl Host {
             temporary: None,
             headroom_inject: None,
             last_headroom: -1e9,
+            initial_reader: None,
         }
+    }
+    /// Attach an already-initialized live reader so `start_live` avoids a redundant initial read.
+    pub fn with_live_reader(mut self, reader: live::Reader) -> Self {
+        self.initial_reader = Some(reader);
+        self
+    }
+    /// Take the pre-warmed live reader if one was attached during launch.
+    pub fn take_live_reader(&mut self) -> Option<live::Reader> {
+        self.initial_reader.take()
     }
     /// Omarchy's usage files and current theme, under the user's state directory.
     pub fn usage_dir() -> Option<PathBuf> {
@@ -127,11 +138,15 @@ impl Host {
 /// thread, for comparison.
 pub fn start_live(h: &mut Host, interval: f64, wake: impl Fn() + Send + 'static) {
     if std::env::var_os("T3_AGENTS_SYNC_READ").is_some() {
+        h.initial_reader = None;
         return;
     }
     if let Some(path) = &h.db {
         let interval = Duration::from_secs_f64(interval.max(0.5));
-        h.live = Some(live::spawn(path, interval, wake));
+        h.live = Some(match h.initial_reader.take() {
+            Some(reader) => live::spawn_with_reader(path, reader, interval, wake),
+            None => live::spawn(path, interval, wake),
+        });
     }
 }
 
@@ -343,6 +358,15 @@ pub fn apply_focus(s: &mut State, title: Option<&str>) -> bool {
     use std::collections::{HashMap, HashSet};
     let linked = title.and_then(|t| integration::thread_for_title(t, &s.snap.agents));
     let mut changed = linked != s.linked;
+    // With no linked thread the family is empty and nothing below reads the maps: the follow
+    // branch needs a linked id, and no agent is in an empty family. Skip building them; this
+    // runs on every wake, usually with no T3 window focused.
+    let Some(linked_id) = linked.as_deref() else {
+        if changed {
+            s.linked = None;
+        }
+        return changed;
+    };
     let parents: HashMap<_, _> = s
         .snap
         .agents
@@ -356,7 +380,7 @@ pub fn apply_focus(s: &mut State, title: Option<&str>) -> bool {
         }
     }
     let mut family = HashSet::new();
-    let mut stack: Vec<&str> = linked.as_deref().into_iter().collect();
+    let mut stack: Vec<&str> = vec![linked_id];
     while let Some(id) = stack.pop() {
         if !family.insert(id) {
             continue;
@@ -541,6 +565,7 @@ mod tests {
             temporary: None,
             headroom_inject: None,
             last_headroom: -1e9,
+            initial_reader: None,
         }
     }
 
@@ -745,5 +770,25 @@ mod tests {
         assert!(apply_focus(&mut s, Some("project / thread")));
         assert!(s.acked.contains("child"));
         assert!(!apply_focus(&mut s, Some("project / thread")));
+    }
+
+    #[test]
+    fn losing_the_linked_window_only_clears_the_link() {
+        let mut s = state(vec![agent("thread", None), agent("child", Some("thread")), agent("other", None)]);
+        s.snap.agent_mut(1).requests.push("approval".into());
+        s.snap.agent_mut(2).requests.push("approval".into());
+        s.collapsed.insert("other".into());
+        assert!(!apply_focus(&mut s, None));
+        assert!(s.acked.is_empty());
+        assert!(apply_focus(&mut s, Some("project / thread")));
+        assert!(s.linked.is_some());
+        let (selected, collapsed, acked) = (s.selected.clone(), s.collapsed.clone(), s.acked.clone());
+        // No title, or one that names no thread: the link goes, and nothing else changes.
+        assert!(apply_focus(&mut s, None));
+        assert_eq!(s.linked, None);
+        assert!(!apply_focus(&mut s, Some("some other window")));
+        assert!(!apply_focus(&mut s, None));
+        assert_eq!((s.selected.clone(), s.collapsed.clone(), s.acked.clone()), (selected, collapsed, acked));
+        assert!(!s.acked.contains("other"));
     }
 }

@@ -138,10 +138,43 @@ pub fn provider(a: &Agent) -> Rgb {
     Palette::default().provider(a)
 }
 
+/// [`family`] for a run of calls that often repeat the previous arguments (agents of one group,
+/// columns that sample one point): a repeat returns the previous answer. `family` is a pure
+/// function of its two strings, so the answers are the same.
+#[derive(Default)]
+pub struct FamilyMemo<'a> {
+    last: Option<(&'a str, Option<&'a str>, ProviderFamily)>,
+}
+
+impl<'a> FamilyMemo<'a> {
+    pub fn family(&mut self, model: &'a str, hint: Option<&'a str>) -> ProviderFamily {
+        if let Some((m, h, f)) = self.last {
+            if m == model && h == hint {
+                return f;
+            }
+        }
+        let f = family(model, hint);
+        self.last = Some((model, hint, f));
+        f
+    }
+}
+
 /// Model provider family from a model name, falling back to a provider id hint (theme.ts `family`).
 pub fn family(model: &str, hint: Option<&str>) -> ProviderFamily {
     fn test(raw: &str) -> Option<ProviderFamily> {
-        let s = raw.to_lowercase();
+        // `to_lowercase` of ASCII text is its ASCII lowercase: do that in place for the usual
+        // short ASCII model name, without allocating. Anything else takes `to_lowercase`.
+        let mut buf = [0u8; 64];
+        let lowered;
+        let s: &str = if raw.is_ascii() && raw.len() <= buf.len() {
+            let b = &mut buf[..raw.len()];
+            b.copy_from_slice(raw.as_bytes());
+            b.make_ascii_lowercase();
+            std::str::from_utf8(b).expect("ASCII")
+        } else {
+            lowered = raw.to_lowercase();
+            &lowered
+        };
         if ["claude", "opus", "sonnet", "haiku", "fable", "anthropic"]
             .iter()
             .any(|k| s.contains(k))
@@ -1004,9 +1037,11 @@ pub fn is_hidden(c: char) -> bool {
 
 /// Control and bidi/format characters replaced by spaces (format.ts `clean`).
 pub fn clean(s: &str) -> String {
-    s.chars()
-        .map(|c| if is_hidden(c) { ' ' } else { c })
-        .collect()
+    // A hidden character becomes one space, never more bytes than it had: the input's length
+    // is enough room.
+    let mut out = String::with_capacity(s.len());
+    out.extend(s.chars().map(|c| if is_hidden(c) { ' ' } else { c }));
+    out
 }
 
 /// Truncate to a display width, ending with an ellipsis when shortened.
@@ -1017,7 +1052,7 @@ pub fn fit(s: &str, max: usize) -> String {
     if width(s) <= max {
         return s.to_string();
     }
-    let mut out = String::new();
+    let mut out = String::with_capacity(s.len() + '…'.len_utf8());
     let mut w = 0;
     for c in s.chars() {
         let cw = cell_width(c);
@@ -1172,6 +1207,18 @@ pub fn js_number(x: f64) -> String {
     if x.is_infinite() {
         return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
     }
+    // A whole number below 2^53: every integer there is a double, so the shortest digits that
+    // name it are its own, and with n <= 16 <= 21 the general path below prints them in plain
+    // decimal with the sign: exactly the integer's decimal form. The labels on every frame
+    // (durations, counts) are almost all such numbers.
+    if x.fract() == 0.0 && x.abs() < 9_007_199_254_740_992.0 {
+        return (x as i64).to_string();
+    }
+    js_number_general(x)
+}
+
+/// [`js_number`] for any finite, nonzero number.
+fn js_number_general(x: f64) -> String {
     let negative = x < 0.0;
     let shortest = format!("{:e}", x.abs()); // shortest round-trip digits, d[.ddd]e±n
     let shortest_digits = shortest
@@ -1610,6 +1657,13 @@ impl Canvas {
             cy1: h as i32,
             oy: 0,
         }
+    }
+
+    /// [`Canvas::new`] followed by [`Canvas::clear`], with the cells written once.
+    pub fn cleared(w: usize, h: usize, bg: Rgb, fg: Rgb) -> Canvas {
+        let (w, h) = (w.max(1), h.max(1));
+        let cell = Cell { ch: ' ', fg, bg, bold: false };
+        Canvas { w, h, cells: vec![cell; w * h], cx0: 0, cy0: 0, cx1: w as i32, cy1: h as i32, oy: 0 }
     }
 
     pub fn resize(&mut self, w: usize, h: usize) {
@@ -2720,6 +2774,62 @@ pub fn plan_row(c: &Canvas, y: usize, base: Rgb) -> RowPlan {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn js_number_whole_numbers_take_the_general_paths_answer() {
+        let mut seeds = vec![1., 2., 7., 9., 10., 59., 60., 99., 100., 1e3, 86_399., 1e15, 1e16 - 1.];
+        seeds.extend([9_007_199_254_740_991., 4_503_599_627_370_496., 123_456_789_012_345.]);
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..20_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let bits = (rng % 53) as u32;
+            seeds.push((rng >> 11 & ((1u64 << bits) - 1).max(1)) as f64);
+        }
+        for x in seeds {
+            for v in [x, -x] {
+                if v != 0. {
+                    assert_eq!(js_number(v), js_number_general(v), "{v}");
+                }
+            }
+        }
+        assert_eq!(js_number(-0.), "0");
+        assert_eq!(js_number(1.5), "1.5");
+        assert_eq!(js_number(9_007_199_254_740_992.), "9007199254740992");
+        assert_eq!(js_number(2f64.powi(60)), "1152921504606847000");
+    }
+
+    #[test]
+    fn family_matches_case_insensitively_on_every_path() {
+        use ProviderFamily::*;
+        let long = format!("{}SONNET", "x".repeat(70));
+        for (model, hint, want) in [
+            ("Claude-Opus-4", None, Claude),
+            ("GPT-5.1-CODEX", None, OpenAi),
+            ("O3", None, OpenAi),
+            ("pro3", None, Other),
+            ("Grok-4", None, Grok),
+            ("unknown", Some("OpenAI"), OpenAi),
+            (long.as_str(), None, Claude),
+            ("ÉCLAUDE", None, Claude),
+            ("Ω-GROK", None, Grok),
+            ("", None, Other),
+        ] {
+            assert_eq!(family(model, hint), want, "{model}");
+        }
+    }
+
+    #[test]
+    fn cleared_is_new_then_clear() {
+        for (w, h) in [(0, 0), (1, 1), (190, 60), (7, 3)] {
+            let mut a = Canvas::new(w, h);
+            (a.cx0, a.cy0, a.cx1, a.cy1, a.oy) = (1, 1, 2, 2, 3);
+            a.clear(0x123456, 0xabcdef);
+            let b = Canvas::cleared(w, h, 0x123456, 0xabcdef);
+            assert_eq!((a.w, a.h, &a.cells), (b.w, b.h, &b.cells));
+            assert_eq!((a.cx0, a.cy0, a.cx1, a.cy1, a.oy), (b.cx0, b.cy0, b.cx1, b.cy1, b.oy));
+        }
+    }
     use super::*;
 
     /// The original's own values (`ramp(p, base + span * (i / cells))` in `oracle/src/theme.ts`,

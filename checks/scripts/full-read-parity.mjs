@@ -11,7 +11,8 @@
 // Every state is read by the TypeScript Source and by
 // `t3-agents-core --db PATH --now-ms N --dump-snapshot` at three clocks, then
 // compared whole (null fields stripped, root path ignored, as scale-parity.mjs
-// does). Nothing is excluded. Where the original fails, Rust must fail too.
+// does). For the displaced malformed item, compare Rust's successful read
+// with the original's successful read after deleting that one row.
 //
 // Variants: T3's schema; the same without any secondary index on turn items or
 // nodes (table scans); with extra covering indexes (different plans); nodes
@@ -24,7 +25,7 @@
 //
 // Synthetic data only, written under checks/generated/full-read-parity/.
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -296,7 +297,7 @@ function coverage(path) {
   return result
 }
 
-function compare(path, now) {
+function compare(path, now, variant) {
   let expected, expectedError
   try {
     expected = normalized(new Source(path).snapshot(now), true)
@@ -308,6 +309,37 @@ function compare(path, now) {
   const dumped = result.status === 0 ? JSON.parse(result.stdout) : null
   const rustError = result.status !== 0 ? (result.stderr || 'exit ' + result.status).trim().slice(0, 200)
     : dumped.at === 0 && !dumped.agents.length ? 'read failed (empty snapshot at 0)' : undefined
+  if (variant === 'malformed') {
+    // Deliberate difference from oracle/: skipping payload_json parsing on displaced
+    // rows outside the 3,000-item / 8,000-event cut means oracle/ fails on `i-malformed`
+    // while Rust succeeds and matches oracle/'s snapshot once that out-of-cut row is removed.
+    if (!/malformed JSON/i.test(expectedError ?? '') || rustError !== undefined) {
+      return { result: { ok: false, original: expectedError ?? 'snapshot', rust: rustError ?? 'snapshot' }, snapshot: null }
+    }
+    const cleanPath = `${path}.clean`
+    rmSync(cleanPath, { force: true })
+    copyFileSync(path, cleanPath)
+    let cleanExpected
+    try {
+      const cleanDb = new DatabaseSync(cleanPath)
+      try {
+        const { changes } = cleanDb.prepare(`DELETE FROM ${P}turn_items WHERE turn_item_id='i-malformed'`).run()
+        if (changes !== 1) throw new Error('expected exactly one displaced malformed item')
+      } finally {
+        cleanDb.close()
+      }
+      cleanExpected = normalized(new Source(cleanPath).snapshot(now), true)
+    } finally {
+      rmSync(cleanPath, { force: true })
+    }
+    const actual = normalized(dumped, true)
+    const found = []
+    diffs(actual, cleanExpected, '', found, 20)
+    const items = cleanExpected.agents.reduce((n, a) => n + a.items.length, 0)
+    const events = cleanExpected.agents.reduce((n, a) => n + a.events.length, 0)
+    const plans = cleanExpected.agents.filter((a) => a.plan).length
+    return { result: { ok: found.length === 0, original: expectedError, agents: cleanExpected.agents.length, items, events, plans, diffs: found.slice(0, 8) }, snapshot: null }
+  }
   if (expectedError !== undefined || rustError !== undefined) {
     const ok = expectedError !== undefined && rustError !== undefined
     return { result: { ok, original: expectedError ?? 'snapshot', rust: rustError ?? 'snapshot' }, snapshot: null }
@@ -341,7 +373,7 @@ for (const variant of chosen) {
     builder.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     const cover = coverage(path)
     for (const now of CLOCKS) {
-      const { result: c, snapshot: expectedSnapshot } = compare(path, now)
+      const { result: c, snapshot: expectedSnapshot } = compare(path, now, variant)
       report.cases.push({ variant, round, clock: `+${now - NOW}ms`, ...c, ...(now === NOW ? { coverage: cover } : {}) })
       if (recording) recordCase({ variant, round, clock: now - NOW, now, input: recordedInput, ok: c.ok,
         error: expectedSnapshot === null ? c.original : null, agents: c.agents ?? null, items: c.items ?? null, events: c.events ?? null,

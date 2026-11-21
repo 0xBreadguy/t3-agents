@@ -1184,7 +1184,9 @@ fn pulse(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, s: &State, p: &Palette)
     let mut by_family = vec![[0usize; 4]; w as usize];
     let mut failed = vec![false; w as usize];
     for a in &s.snap.agents {
-        let fam = family_of(a);
+        // The family is a pure function of the agent's model names and is only needed for an
+        // event in the window: work it out at the first one, not for every agent on every frame.
+        let mut fam = None;
         for e in &a.events {
             if e.t > s.now + 5000. || !tool(&e.cat) {
                 continue;
@@ -1195,7 +1197,7 @@ fn pulse(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, s: &State, p: &Palette)
             }
             let i = i as usize;
             counts[i] += 1;
-            by_family[i / 2][fam] += 1;
+            by_family[i / 2][*fam.get_or_insert_with(|| family_of(a))] += 1;
             failed[i / 2] |= e.failed;
         }
     }

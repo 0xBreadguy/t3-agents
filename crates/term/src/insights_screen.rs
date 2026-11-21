@@ -220,10 +220,27 @@ impl InsightsScreen {
         full: &mut bool,
         wake: &Arc<Wake>,
     ) -> io::Result<()> {
+        self.present_key_with(state, source, path, size, encoder, full, wake, &mut write_frame)
+    }
+
+    /// [`InsightsScreen::present_key`] with each frame handed to `sink` (the stream check hashes
+    /// it; the dashboard writes it).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn present_key_with(
+        &mut self,
+        state: &State,
+        source: InsightsSource,
+        path: Option<&Path>,
+        size: (usize, usize),
+        encoder: &mut Encoder,
+        full: &mut bool,
+        wake: &Arc<Wake>,
+        sink: &mut FrameSink<'_>,
+    ) -> io::Result<()> {
         // write_stdout writes directly to the tty before dispatch, even on demo.
-        self.paint(state, source, size, encoder, full)?;
+        self.paint_with(state, source, size, encoder, full, sink)?;
         if self.dispatch(source, path, wake) {
-            self.paint(state, source, size, encoder, full)?;
+            self.paint_with(state, source, size, encoder, full, sink)?;
         }
         Ok(())
     }
@@ -236,13 +253,41 @@ impl InsightsScreen {
         encoder: &mut Encoder,
         full: &mut bool,
     ) -> io::Result<()> {
-        let bytes = encoder.encode(self.frame(state, source, size), *full);
-        *full = false;
-        if !bytes.is_empty() {
-            platform::write_stdout(&bytes)?;
-        }
-        Ok(())
+        self.paint_with(state, source, size, encoder, full, &mut write_frame)
     }
+
+    /// [`InsightsScreen::paint`] with the canvas, its bytes and whether it was a full repaint
+    /// handed to `sink`.
+    pub(super) fn paint_with(
+        &mut self,
+        state: &State,
+        source: InsightsSource,
+        size: (usize, usize),
+        encoder: &mut Encoder,
+        full: &mut bool,
+        sink: &mut FrameSink<'_>,
+    ) -> io::Result<()> {
+        let was_full = *full;
+        let canvas = self.frame(state, source, size);
+        let bytes = encoder.encode(canvas, was_full);
+        *full = false;
+        sink(canvas, &bytes, was_full)
+    }
+
+    /// Whether a read is running (the stream check waits for it instead of for a wake).
+    #[cfg(feature = "frame-stream")]
+    pub(super) fn loading(&self) -> bool {
+        self.data.loading_since().is_some()
+    }
+}
+
+pub(super) type FrameSink<'a> = dyn FnMut(&Canvas, &[u8], bool) -> io::Result<()> + 'a;
+
+fn write_frame(_: &Canvas, bytes: &[u8], _: bool) -> io::Result<()> {
+    if !bytes.is_empty() {
+        platform::write_stdout(bytes)?;
+    }
+    Ok(())
 }
 
 fn borrow_report(snapshot: &Snapshot) -> Option<view::Report<'_>> {

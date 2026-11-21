@@ -4,7 +4,8 @@
 //!
 //! Each variant's database travels once, as SQL text; the mutations between rounds travel as the
 //! statements the original's builder ran. Each case compares the digest of the whole normalized
-//! snapshot, plus counts, and where the original failed the Rust reader must fail too.
+//! snapshot, plus counts. The displaced malformed case uses the recorded clean
+//! snapshot at the same clock.
 #[path = "golden_support/mod.rs"]
 mod support;
 use rusqlite::types::Value as SqlValue;
@@ -81,7 +82,16 @@ fn full_reader_under_ties_matches_frozen_oracle() {
             let now = case["now"].as_f64().unwrap();
             let output = support::run(BINARY, &["--db", path.to_str().unwrap(), "--now-ms", &format!("{now}"), "--dump-snapshot"], &home, &[]);
             let named = format!("{variant} round {round} clock {:+}ms", case["clock"].as_i64().unwrap());
-            if case["error"].as_str().is_some() {
+            let expected = if variant == "malformed" {
+                assert!(case["error"].as_str().unwrap_or("").contains("malformed JSON"));
+                // Deliberate difference from oracle/: skipping payload_json parsing on displaced
+                // out-of-cut rows means Rust succeeds on `malformed` round 0 and matches the
+                // recorded `t3` round-0 snapshot at the same clock.
+                cases
+                    .iter()
+                    .find(|c| c["variant"] == "t3" && c["round"] == 0 && c["clock"] == case["clock"])
+                    .expect("recorded t3 round 0 case at matching clock")
+            } else if case["error"].as_str().is_some() {
                 // The original failed: `--dump-snapshot` prints an empty snapshot stamped at 0.
                 let failed = output.status.code() != Some(0)
                     || serde_json::from_slice::<Value>(&output.stdout).map(|v| v["at"].as_f64() == Some(0.0) && v["agents"].as_array().is_some_and(|a| a.is_empty())).unwrap_or(false);
@@ -89,7 +99,9 @@ fn full_reader_under_ties_matches_frozen_oracle() {
                     failures.push(format!("{named}: the original reported {:?}, the Rust reader returned a snapshot", case["error"].as_str()));
                 }
                 continue;
-            }
+            } else {
+                case
+            };
             if output.status.code() != Some(0) {
                 failures.push(format!("{named}: Rust failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
                 continue;
@@ -102,21 +114,21 @@ fn full_reader_under_ties_matches_frozen_oracle() {
                 }
             };
             if dump["at"].as_f64() == Some(0.0) && dump["agents"].as_array().is_some_and(|a| a.is_empty()) {
-                failures.push(format!("{named}: Rust reported a failed read; the original returned a snapshot"));
+                failures.push(format!("{named}: Rust reported a failed read; expected a snapshot"));
                 continue;
             }
             let snapshot = support::normalize(&dump, true);
             let digest = support::canonical_digest(&snapshot);
-            if digest != case["digest"].as_str().unwrap() {
+            if digest != expected["digest"].as_str().unwrap() {
                 let agents = snapshot["agents"].as_array().unwrap();
                 let items: usize = agents.iter().map(|a| a["items"].as_array().map_or(0, Vec::len)).sum();
                 let events: usize = agents.iter().map(|a| a["events"].as_array().map_or(0, Vec::len)).sum();
                 let plans = agents.iter().filter(|a| !a["plan"].is_null()).count();
                 failures.push(format!(
                     "{named}: snapshot {digest} instead of {}; rust has {} agents, {items} items, {events} events, {plans} plans (recorded {}/{}/{}/{})",
-                    case["digest"],
+                    expected["digest"],
                     agents.len(),
-                    case["agents"], case["items"], case["events"], case["plans"]
+                    expected["agents"], expected["items"], expected["events"], expected["plans"]
                 ));
             }
             // The counts are part of the recording too, so a digest collision cannot hide a shrunken read.
@@ -124,7 +136,7 @@ fn full_reader_under_ties_matches_frozen_oracle() {
             let items: usize = agents.iter().map(|a| a["items"].as_array().map_or(0, Vec::len)).sum();
             let events: usize = agents.iter().map(|a| a["events"].as_array().map_or(0, Vec::len)).sum();
             let plans = agents.iter().filter(|a| !a["plan"].is_null()).count();
-            if Some(agents.len() as i64) != case["agents"].as_i64() || Some(items as i64) != case["items"].as_i64() || Some(events as i64) != case["events"].as_i64() || Some(plans as i64) != case["plans"].as_i64() {
+            if Some(agents.len() as i64) != expected["agents"].as_i64() || Some(items as i64) != expected["items"].as_i64() || Some(events as i64) != expected["events"].as_i64() || Some(plans as i64) != expected["plans"].as_i64() {
                 failures.push(format!("{named}: counts {} agents, {items} items, {events} events, {plans} plans differ from the recording", agents.len()));
             }
         }

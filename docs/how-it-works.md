@@ -44,6 +44,14 @@ writes to it, and it makes no network connections.
   contents or remove anything. T3 Code owns the `storageCleanup` and
   `worktreeCleanup` settings. The demo uses example folder sizes. An explicit
   `--db` skips filesystem measurements. Disk measurements are Linux-only.
+- **Reading everything, on several connections:** `--once`, `--status` and
+  the dashboard's first data read every table it uses once. That read runs on
+  up to three read-only connections at the same time. Before any of them
+  reads, it asks SQLite (`PRAGMA data_version`) whether a write landed while
+  they were starting, so all of them see the same moment, and it checks that
+  the database files are still the ones it opened. If it can't be sure, or
+  anything fails, it reads on one connection instead.
+  `T3_AGENTS_FULL_READ_THREADS=1` always reads on one connection.
 - **Staying current without rereading everything:** every two seconds it asks
   SQLite whether T3 has written anything by default. If it has, it reads the new entries
   in T3's event log to learn which threads changed, and rereads only those. From

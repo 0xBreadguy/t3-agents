@@ -13,7 +13,7 @@ use t3_agents_core::{
     cli::{self, interaction_state},
     clock, demo, host,
     host::{Clock, Host},
-    integration,
+    integration, live,
     model::{Snapshot, State},
     product::{self, Command, Database},
     recap, source, terminal, theme, trace, trace_live, trace_view,
@@ -29,6 +29,8 @@ mod insights_screen;
 use insights_screen::{Effect as InsightsEffect, InsightsScreen, InsightsSource};
 mod storage_screen;
 use storage_screen::StorageScreen;
+#[cfg(feature = "frame-stream")]
+mod stream_check;
 
 struct TermClock {
     now: f64,
@@ -188,12 +190,13 @@ fn on_key(s: &mut State, host: &mut Host, clock: &mut TermClock, name: &str, rep
         return false;
     }
     clock.instant();
-    let before = s
-        .rows()
-        .iter()
-        .find(|r| Some(&r.id) == s.selected.as_ref())
-        .map(|r| r.is_earlier())
-        .unwrap_or(false);
+    // Only opening a thread needs the pre-action row's earlier/folded state.
+    let opening = matches!(name, "enter" | "o");
+    let before = opening
+        && s.rows()
+            .iter()
+            .find(|r| Some(&r.id) == s.selected.as_ref())
+            .is_some_and(|r| r.is_earlier());
     let now = host::input_now(s, host);
     let secs = clock.clock();
     let db = host.db.is_some();
@@ -207,7 +210,7 @@ fn on_key(s: &mut State, host: &mut Host, clock: &mut TermClock, name: &str, rep
             epoch + secs * 1000.
         }
     });
-    if matches!(name, "enter" | "o") && !before {
+    if opening && !before {
         host::open_selected(s, host);
     }
     if name == "r" && !s.paused {
@@ -334,6 +337,29 @@ fn paint(
     full: &mut bool,
     tracing: &mut Option<trace_live::Screen>,
 ) -> io::Result<()> {
+    paint_with(s, storage, cols, rows, enc, full, tracing, &mut |_, bytes, _| {
+        if !bytes.is_empty() {
+            platform::write_stdout(bytes)?;
+        }
+        Ok(())
+    })
+}
+
+/// What the loop does to draw a frame, with the finished canvas, its bytes and whether the frame
+/// was a full repaint handed to `sink`. [`paint`] writes the bytes; the stream check hashes them.
+type Sink<'a> = dyn FnMut(&terminal::Canvas, &[u8], bool) -> io::Result<()> + 'a;
+
+#[allow(clippy::too_many_arguments)]
+fn paint_with(
+    s: &mut State,
+    storage: &mut StorageScreen,
+    cols: usize,
+    rows: usize,
+    enc: &mut Encoder,
+    full: &mut bool,
+    tracing: &mut Option<trace_live::Screen>,
+    sink: &mut Sink<'_>,
+) -> io::Result<()> {
     let canvas = match tracing.as_mut() {
         Some(t) => {
             let mut canvas = draw_trace(s, t, cols.max(1), rows.max(1));
@@ -342,12 +368,10 @@ fn paint(
         },
         _ => storage.render(s, (cols, rows)).unwrap_or_else(|| compose(s, cols, rows)),
     };
+    let was_full = *full;
     let bytes = enc.encode(&canvas, *full);
     *full = false;
-    if !bytes.is_empty() {
-        platform::write_stdout(&bytes)?;
-    }
-    Ok(())
+    sink(&canvas, &bytes, was_full)
 }
 
 type Launch = (State, Host, StorageSource, Option<InsightsSource>);
@@ -755,7 +779,24 @@ fn product_launch(
             (state, Host::demo(now))
         }
         Database::Path { path, .. } => {
-            let mut state = match source::snapshot(&path, now) {
+            let mut initial_reader = None;
+            let result = if std::env::var_os("T3_AGENTS_SYNC_READ").is_some() {
+                source::snapshot(&path, now)
+            } else {
+                match live::Reader::open(&path).and_then(|mut reader| {
+                    let update = reader.poll(now)?;
+                    if update.served == live::Served::Full {
+                        clock::release_memory();
+                    }
+                    initial_reader = Some(reader);
+                    Ok(update.snapshot)
+                }) {
+                    Ok(snapshot) => Ok(snapshot),
+                    // Any failure reads as the reference does, with its error.
+                    Err(_) => source::snapshot(&path, now),
+                }
+            };
+            let mut state = match result {
                 Ok(snapshot) => State::new(snapshot),
                 Err(e) => failed(
                     Snapshot {
@@ -767,7 +808,11 @@ fn product_launch(
             };
             state.demo = false;
             state.usage.clear();
-            (state, Host::live(path, now))
+            let mut host = Host::live(path, now);
+            if let Some(reader) = initial_reader {
+                host = host.with_live_reader(reader);
+            }
+            (state, host)
         }
     };
     state.calm = calm;
@@ -804,6 +849,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(n) = cli::option("--bench-term") {
             return bench(&n);
+        }
+        #[cfg(feature = "frame-stream")]
+        if std::env::args().any(|a| a == "--frame-stream") {
+            return stream_check::run();
         }
         if !io::stdout().is_terminal() {
             return Err("stdout is not a terminal".into());
@@ -881,5 +930,72 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("t3-agents-term: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The demo's state, as the product launches it, but with a fixed clock and no theme files.
+    /// `Host::demo` never opens a window or a link: `enter` and `o` only set a notice.
+    fn demo_state() -> (State, Host, TermClock) {
+        let now = 1_795_163_100_000.0;
+        let mut state = State::new(demo::snapshot(now, now).expect("the demo snapshot builds"));
+        state.demo = true;
+        state.calm = false;
+        (state, Host::demo(now), TermClock { now: 0., wake: None })
+    }
+
+    fn select(s: &mut State, id: &str) {
+        assert!(s.rows().iter().any(|r| r.id == id), "{id} is not a row of the demo");
+        let at = s.now;
+        s.pick_at(id, at);
+    }
+
+    fn first_earlier_row(s: &State) -> String {
+        s.rows()
+            .iter()
+            .find(|r| r.is_earlier())
+            .expect("the demo folds one family's older children")
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn enter_and_o_unfold_a_folded_earlier_row_without_opening_anything() {
+        for key in ["enter", "o"] {
+            let (mut s, mut host, mut clock) = demo_state();
+            let earlier = first_earlier_row(&s);
+            let before = s.rows().len();
+            select(&mut s, &earlier);
+            assert_eq!(s.notice, None, "no notice before the key");
+            assert!(!on_key(&mut s, &mut host, &mut clock, key, false), "{key} does not quit");
+            assert!(
+                !s.notice.as_deref().is_some_and(|n| n.starts_with("Demo: would open")),
+                "{key} on an earlier row opened a thread: {:?}",
+                s.notice
+            );
+            assert!(s.rows().len() > before, "{key} unfolded the earlier row");
+            assert!(s.rows().iter().all(|r| r.id != earlier), "the earlier row is gone once unfolded");
+            let picked = s.selected.clone().expect("a row stays selected");
+            assert!(
+                s.rows().iter().any(|r| r.id == picked && !r.is_earlier()),
+                "{key} selects the first revealed row, got {picked}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_and_o_open_an_ordinary_agent_row() {
+        for key in ["enter", "o"] {
+            let (mut s, mut host, mut clock) = demo_state();
+            let row = s.rows().into_iter().find(|r| !r.is_earlier()).expect("the demo has ordinary rows");
+            select(&mut s, &row.id);
+            assert_eq!(s.notice, None, "no notice before the key");
+            assert!(!on_key(&mut s, &mut host, &mut clock, key, false), "{key} does not quit");
+            let notice = s.notice.as_deref().unwrap_or_default();
+            assert!(notice.starts_with("Demo: would open"), "{key} on {} said {notice:?}", row.id);
+        }
     }
 }

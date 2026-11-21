@@ -282,6 +282,7 @@ version = "1.4.0"
 dependencies = [
  "indexmap",
  "libc",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",

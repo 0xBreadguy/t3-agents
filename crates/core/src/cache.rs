@@ -281,7 +281,7 @@ fn wal_header(_db: &Connection) -> Option<[u8; 48]> {
     None
 }
 
-fn handle_matches(db: &Connection, path: &Path) -> bool {
+pub(crate) fn handle_matches(db: &Connection, path: &Path) -> bool {
     if db.path().is_none_or(|name| Path::new(name) != path) {
         return false;
     }

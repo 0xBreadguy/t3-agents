@@ -4,6 +4,49 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+/// FxHash's word mixing: a fast hasher for maps keyed by ids the program holds itself, where
+/// SipHash's resistance to chosen keys buys nothing. Iteration order differs from SipHash's;
+/// nothing that writes output iterates such a map without sorting it.
+#[derive(Clone, Copy, Default)]
+pub struct IdHasher(u64);
+
+impl IdHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for IdHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub type IdHash = std::hash::BuildHasherDefault<IdHasher>;
+
 pub const RECENT_MS: f64 = 3.0 * 3_600_000.0;
 pub const RECENT_MAX: usize = 3;
 pub const WINDOWS: [u32; 4] = [15, 30, 60, 180];
@@ -871,7 +914,8 @@ pub struct State {
     pub shimmer: HashMap<String, f64>,
     pub seeded: bool,
     pub boot_at: f64,
-    pub tween: HashMap<String, f64>,
+    /// Keyed by agent id and read for every agent on every frame, so hashed with [`IdHash`].
+    pub tween: HashMap<String, f64, IdHash>,
     pub palette: crate::terminal::Palette,
     pub notice_at: f64,
     pub notice_error: bool,
@@ -932,7 +976,7 @@ impl State {
             shimmer: HashMap::new(),
             seeded: false,
             boot_at: now,
-            tween: HashMap::new(),
+            tween: HashMap::default(),
             palette: crate::terminal::Palette::default(),
             notice_at: 0.,
             notice_error: false,
@@ -1233,7 +1277,12 @@ impl State {
                 .filter(|(_, m)| *m > 0.)
                 .map(|(u, m)| (u / m).clamp(0., 1.))
                 .unwrap_or(0.);
-            let cur = self.tween.entry(a.id.clone()).or_insert(0.);
+            // `entry(a.id.clone()).or_insert(0.)` without cloning the id when it is already there,
+            // which after the first frame it always is.
+            let cur = match self.tween.get_mut(&a.id) {
+                Some(cur) => cur,
+                None => self.tween.entry(a.id.clone()).or_insert(0.),
+            };
             let next = if calm {
                 target
             } else {
@@ -1276,13 +1325,15 @@ impl State {
             .iter()
             .find(|a| Some(&a.id) == self.selected.as_ref())
             .is_some_and(|a| {
+                let mut key = String::new();
                 a.items
                     .iter()
                     .filter(|i| !matches!(i.kind.as_str(), "reasoning" | "assistant_message"))
                     .take(16)
                     .any(|i| {
+                        item_key_into(i, &mut key);
                         self.first_seen
-                            .get(&item_key(i))
+                            .get(key.as_str())
                             .is_some_and(|at| *at > 0. && (self.now - *at).max(0.) < 1600.)
                     })
             });
@@ -2532,6 +2583,37 @@ mod tests {
 
 #[cfg(test)]
 mod label_tests {
+    #[test]
+    fn item_key_is_the_joined_fields() {
+        let mut item = super::Item::default();
+        let reference = |i: &super::Item| {
+            format!(
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                i.thread_id,
+                i.run_id.as_deref().unwrap_or(""),
+                i.node_id.as_deref().unwrap_or(""),
+                i.kind,
+                i.tool.as_deref().unwrap_or(""),
+                i.started_at.as_deref().unwrap_or(&i.updated_at),
+                i.command,
+                i.file
+            )
+        };
+        assert_eq!(super::item_key(&item), reference(&item));
+        item.thread_id = "t-1".into();
+        item.run_id = Some("r".into());
+        item.kind = "command_execution".into();
+        item.updated_at = "2026-11-20T00:00:00Z".into();
+        item.command = "ls\0x ✓".into();
+        assert_eq!(super::item_key(&item), reference(&item));
+        item.started_at = Some("2026-11-19T23:59:59Z".into());
+        item.tool = Some("bash".into());
+        item.node_id = Some("n".into());
+        item.file = "a/b".into();
+        let mut reused = String::from("left over");
+        super::item_key_into(&item, &mut reused);
+        assert_eq!(reused, reference(&item));
+    }
     use super::*;
     fn item(kind: &str, label: &str, command: &str, file: &str) -> Item {
         Item {
@@ -2605,15 +2687,28 @@ mod label_tests {
 
 /// Projection metadata identity; never includes prompt, message, or result bodies.
 pub fn item_key(i: &Item) -> String {
-    format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        i.thread_id,
+    let mut key = String::new();
+    item_key_into(i, &mut key);
+    key
+}
+/// [`item_key`] written into `key`, replacing what it held, so a caller can reuse one buffer.
+pub fn item_key_into(i: &Item, key: &mut String) {
+    let parts = [
+        i.thread_id.as_str(),
         i.run_id.as_deref().unwrap_or(""),
         i.node_id.as_deref().unwrap_or(""),
-        i.kind,
+        i.kind.as_str(),
         i.tool.as_deref().unwrap_or(""),
         i.started_at.as_deref().unwrap_or(&i.updated_at),
-        i.command,
-        i.file
-    )
+        i.command.as_str(),
+        i.file.as_str(),
+    ];
+    key.clear();
+    key.reserve(parts.iter().map(|p| p.len() + 1).sum());
+    for (n, part) in parts.iter().enumerate() {
+        if n > 0 {
+            key.push('\0');
+        }
+        key.push_str(part);
+    }
 }

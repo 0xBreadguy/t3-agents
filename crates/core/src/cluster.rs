@@ -678,6 +678,31 @@ pub fn lay_out(canvas: &Canvas, method: WidthMethod) -> Laid {
     let mut laid = Laid::new(canvas.w, canvas.h);
     let mut text = String::new();
     for y in 0..canvas.h {
+        laid.draw_row(canvas, y, method, &mut text);
+    }
+    laid
+}
+
+impl Laid {
+    /// Lay out row `y` of `canvas` again, as [`lay_out`] lays out that row into a cleared
+    /// buffer. A row's layout reads only that row of the canvas and writes only that row of the
+    /// buffer (`set` keeps its span cleanup inside the row, `draw_text` writes one row), so a
+    /// buffer laid out for one canvas and then given this for every row in which a second canvas
+    /// differs is cell for cell what [`lay_out`] gives for the second canvas. Text interned for
+    /// earlier rows stays in the table: [`Laid::same`] compares cluster text, not ids.
+    pub fn relay_row(&mut self, canvas: &Canvas, y: usize, method: WidthMethod, text: &mut String) {
+        let row = y * self.w;
+        self.cells[row..row + self.w].fill(LaidCell::CLEARED);
+        self.draw_row(canvas, y, method, text);
+    }
+
+    /// How many multi-character cluster texts the buffer holds.
+    pub fn text_count(&self) -> usize {
+        self.texts.len()
+    }
+
+    /// [`lay_out`]'s loop for one row, into cells already cleared.
+    fn draw_row(&mut self, canvas: &Canvas, y: usize, method: WidthMethod, text: &mut String) {
         let row = &canvas.cells[y * canvas.w..(y + 1) * canvas.w];
         let mut x = 0;
         while x < canvas.w {
@@ -696,11 +721,10 @@ pub fn lay_out(canvas: &Canvas, method: WidthMethod) -> Laid {
                 }
                 end += 1;
             }
-            laid.draw_text(&text, x, y, first.fg, first.bg, first.bold, method);
+            self.draw_text(text, x, y, first.fg, first.bg, first.bold, method);
             x = end;
         }
     }
-    laid
 }
 
 /// What XTVERSION (`CSI > 0 q`) answered: the terminal's name and version, as OpenTUI's

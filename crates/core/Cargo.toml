@@ -12,7 +12,12 @@ serde.workspace = true
 serde_json.workspace = true
 indexmap.workspace = true
 libc.workspace = true
+memchr = "2"
 rusqlite.workspace = true
+
+[features]
+# The presenter's deterministic frame-stream check (`--frame-stream`) posts polls to a detached mailbox.
+frame-stream = []
 
 [dev-dependencies]
 flate2 = "1"

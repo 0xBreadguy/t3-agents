@@ -27,6 +27,8 @@ unsafe extern "C" {
     fn malloc_trim(pad: usize) -> i32;
 }
 
+mod poll1;
+
 /// An agent reduced to what the bar's status line reads (`status::status`):
 /// title, status, model, provider id and the run's `provider`, context tokens,
 /// start time, requests, events (time and failure) and the current item's
@@ -223,14 +225,52 @@ fn sidecars(path: &Path) -> Sidecars {
     }
 }
 fn error(path: &Path, detail: impl ToString) -> SourceError {
+    if !path.exists() {
+        SourceError {
+            kind: "missing",
+            path: path.into(),
+            detail: String::new(),
+        }
+    } else if path.is_dir() {
+        SourceError {
+            kind: "unreadable",
+            path: path.into(),
+            detail: "it is a folder, not a file".into(),
+        }
+    } else {
+        SourceError {
+            kind: "unreadable",
+            path: path.into(),
+            detail: detail.to_string(),
+        }
+    }
+}
+fn sql_error(path: &Path, err: rusqlite::Error) -> SourceError {
+    if !path.exists() {
+        return SourceError {
+            kind: "missing",
+            path: path.into(),
+            detail: String::new(),
+        };
+    }
+    if path.is_dir() {
+        return SourceError {
+            kind: "unreadable",
+            path: path.into(),
+            detail: "it is a folder, not a file".into(),
+        };
+    }
+    if matches!(&err, rusqlite::Error::SqliteFailure(e, _) if e.extended_code == 26) {
+        return SourceError {
+            kind: "unreadable",
+            path: path.into(),
+            detail: "not a SQLite database".into(),
+        };
+    }
     SourceError {
-        kind: if path.exists() {
-            "unreadable"
-        } else {
-            "missing"
-        },
+        kind: "unreadable",
         path: path.into(),
-        detail: detail.to_string(),
+        detail: err.to_string(),
     }
 }
 fn open(path: &Path) -> Result<Connection, SourceError> {
@@ -238,10 +278,10 @@ fn open(path: &Path) -> Result<Connection, SourceError> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| error(path, e))?;
+    .map_err(|e| sql_error(path, e))?;
     db.busy_timeout(Duration::from_millis(250))
-        .map_err(|e| error(path, e))?;
-    crate::asks::register(&db).map_err(|e| error(path, e))?;
+        .map_err(|e| sql_error(path, e))?;
+    crate::asks::register(&db).map_err(|e| sql_error(path, e))?;
     // The scale databases are hundreds of megabytes of unread payload padding.
     // Leave them on disk: a mapped file stays in this process's resident set
     // after the baseline scan, and the parsed cache is much smaller.
@@ -249,7 +289,7 @@ fn open(path: &Path) -> Result<Connection, SourceError> {
     // payload pages that a small page cache cannot hold. Keep that cache small
     // to leave more memory for the parsed rows.
     db.execute_batch("PRAGMA query_only=ON; PRAGMA mmap_size=0; PRAGMA cache_size=-500")
-        .map_err(|e| error(path, e))?;
+        .map_err(|e| sql_error(path, e))?;
     // The same projections are prepared on every changed poll.
     db.set_prepared_statement_cache_capacity(64);
     Ok(db)
@@ -263,7 +303,7 @@ fn settle(db: &Connection, path: &Path) -> Sidecars {
 fn scalar(db: &Connection, sql: &str, path: &Path) -> Result<i64, SourceError> {
     db.prepare_cached(sql)
         .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
-        .map_err(|e| error(path, e))
+        .map_err(|e| sql_error(path, e))
 }
 
 const EVENT_SUFFIX: &str =
@@ -603,7 +643,6 @@ fn read_feed(
 mod cache {
     use super::*;
     use rusqlite::types::Value as SqlValue;
-    use serde::Deserialize;
     use serde_json::{Value, json};
     use std::{
         borrow::Cow,
@@ -614,7 +653,7 @@ mod cache {
         sync::OnceLock,
     };
 
-    const TABLES: [&str; 8] = [
+    pub(super) const TABLES: [&str; 8] = [
         "threads",
         "runs",
         "subagents",
@@ -625,47 +664,36 @@ mod cache {
         "turn_items",
     ];
 
-    fn payload<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
-        let text = String::deserialize(d)?;
-        serde_json::from_str(&text).map_err(serde::de::Error::custom)
+    #[derive(Clone, Debug)]
+    pub(super) struct Payload {
+        pub(super) payload: Value,
     }
-    #[derive(Clone, Debug, Deserialize)]
-    struct Payload {
-        #[serde(deserialize_with = "payload")]
-        payload: Value,
+    #[derive(Clone, Debug)]
+    pub(super) struct Thread {
+        pub(super) data: Payload,
+        pub(super) archived_at: Option<String>,
+        pub(super) deleted_at: Option<String>,
     }
-    #[derive(Clone, Debug, Deserialize)]
-    struct Thread {
-        #[serde(flatten)]
-        data: Payload,
-        archived_at: Option<String>,
-        deleted_at: Option<String>,
-    }
-    #[derive(Clone, Debug, Deserialize)]
-    struct Run {
-        #[serde(flatten)]
-        data: Payload,
-        ordinal: i64,
-        requested_at: String,
-        completed_at: Option<String>,
+    #[derive(Clone, Debug)]
+    pub(super) struct Run {
+        pub(super) data: Payload,
+        pub(super) ordinal: i64,
+        pub(super) requested_at: String,
+        pub(super) completed_at: Option<String>,
     }
     /// Canonical ISO-8601 stamps sort like their millisecond value and are stored
     /// as that integer. Anything else keeps the original text. A canonical stamp
     /// is never stored as `Raw`, so the two variants do not alias. `Raw` holds a
     /// thin pointer, so a stamp is 16 bytes on every turn item.
     #[derive(Clone, Debug)]
-    enum Stamp {
+    pub(super) enum Stamp {
         Ms(i64),
         Raw(Arc<String>),
     }
     impl Stamp {
-        fn parse(text: &str) -> Self {
-            if canonical_stamp(text) {
-                let ms = crate::model::ms(Some(text)).unwrap();
-                let millis = ms.floor() as i64;
-                if source::iso(millis as f64) == text {
-                    return Stamp::Ms(millis);
-                }
+        pub(super) fn parse(text: &str) -> Self {
+            if let Some(millis) = poll1::parse_canonical_utc_ms(text) {
+                return Stamp::Ms(millis);
             }
             Stamp::Raw(Arc::new(text.to_owned()))
         }
@@ -721,7 +749,7 @@ mod cache {
             }
         }
     }
-    fn stamp_opt(text: Option<String>) -> Option<Stamp> {
+    pub(super) fn stamp_opt(text: Option<String>) -> Option<Stamp> {
         text.map(|text| Stamp::parse(&text))
     }
     fn ms_of(stamp: &Option<Stamp>) -> Option<f64> {
@@ -729,12 +757,16 @@ mod cache {
     }
     /// `updated_at >= since`, matching SQLite text order. `since` is usually
     /// `source::iso`, so a canonical stamp compares as an integer.
-    fn stamp_ge(stamp: &Stamp, since: &str) -> bool {
+    pub(super) fn stamp_ge(stamp: &Stamp, since: &str) -> bool {
         match stamp {
-            Stamp::Ms(ms) if canonical_stamp(since) => {
-                *ms as f64 >= crate::model::ms(Some(since)).unwrap_or(f64::NEG_INFINITY)
+            Stamp::Ms(ms) => {
+                if let Some(since_ms) = poll1::parse_canonical_utc_ms(since) {
+                    *ms >= since_ms
+                } else {
+                    stamp.text().as_ref() >= since
+                }
             }
-            _ => stamp.text().as_ref() >= since,
+            Stamp::Raw(text) => text.as_str() >= since,
         }
     }
     fn opt_same(held: &Option<Arc<str>>, fresh: &Option<String>) -> bool {
@@ -744,34 +776,37 @@ mod cache {
             _ => false,
         }
     }
-    struct ItemText {
-        rowid: i64,
-        thread_id: String,
-        run_id: Option<String>,
-        node_id: Option<String>,
-        provider_thread_id: Option<String>,
-        kind: String,
-        status: String,
-        updated_at: Stamp,
-        started_at: Option<Stamp>,
-        tool: Option<String>,
-        exit_code: Option<i32>,
-        ordinal: i64,
-        body: Body,
-        steps: Option<Arc<str>>,
+    pub(super) struct ItemPayloadRead {
+        pub(super) rowid: i64,
+        pub(super) thread_id: String,
+        pub(super) run_id: Option<String>,
+        pub(super) node_id: Option<String>,
+        pub(super) provider_thread_id: Option<String>,
+        pub(super) kind: String,
+        pub(super) status: String,
+        pub(super) updated_at: Stamp,
+        pub(super) started_at: Option<Stamp>,
+        pub(super) tool: Option<String>,
+        pub(super) exit_code: Option<i32>,
+        pub(super) ordinal: i64,
+        pub(super) text: Option<Text>,
     }
-    fn blank() -> Arc<str> {
+    pub(super) fn blank() -> Arc<str> {
         static BLANK: OnceLock<Arc<str>> = OnceLock::new();
         Arc::clone(BLANK.get_or_init(|| Arc::from("")))
+    }
+    pub(super) fn empty_json() -> Arc<str> {
+        static EMPTY_JSON: OnceLock<Arc<str>> = OnceLock::new();
+        Arc::clone(EMPTY_JSON.get_or_init(|| Arc::from("{}")))
     }
     /// Repeated identity strings (kinds, statuses, tool names, ids). Not used
     /// for timestamps or for label, command, file or turn JSON: those are unique.
     #[derive(Clone, Default)]
     pub(super) struct Pool {
-        values: HashSet<Arc<str>>,
+        values: HashSet<Arc<str>, std::hash::BuildHasherDefault<poll1::FnvHasher>>,
     }
     impl Pool {
-        fn intern(&mut self, text: &str) -> Arc<str> {
+        pub(super) fn intern(&mut self, text: &str) -> Arc<str> {
             if let Some(found) = self.values.get(text) {
                 return Arc::clone(found);
             }
@@ -779,34 +814,50 @@ mod cache {
             self.values.insert(Arc::clone(&arc));
             arc
         }
-        fn intern_opt(&mut self, text: Option<String>) -> Option<Arc<str>> {
-            text.map(|text| self.intern(&text))
+        pub(super) fn intern_opt_ref(&mut self, text: Option<&str>) -> Option<Arc<str>> {
+            text.map(|text| self.intern(text))
         }
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct Body {
-        label: Arc<str>,
-        command: Arc<str>,
-        file: Arc<str>,
+    pub(super) struct Body {
+        pub(super) label: Arc<str>,
+        pub(super) command: Arc<str>,
+        pub(super) file: Arc<str>,
     }
     /// Projected turn JSON kept as the SQL text, plus the fields a history or
     /// identity check needs without parsing every turn on a content poll.
     #[derive(Clone, Debug)]
-    struct Turn {
-        json: Arc<str>,
-        provider_thread_id: Arc<str>,
-        ordinal: i64,
-        started_at: Option<Stamp>,
-        completed_at: Option<Stamp>,
-        model_bad: bool,
-        identity_bad: bool,
-        model: Option<Arc<str>>,
-        used: f64,
-        max: f64,
+    pub(super) struct Turn {
+        pub(super) json: Arc<str>,
+        pub(super) provider_thread_id: Arc<str>,
+        pub(super) ordinal: i64,
+        pub(super) started_at: Option<Stamp>,
+        pub(super) completed_at: Option<Stamp>,
+        pub(super) model_bad: bool,
+        pub(super) identity_bad: bool,
+        pub(super) context_bad: bool,
+        pub(super) lean_context: Option<Box<crate::model::Context>>,
+        pub(super) model: Option<Arc<str>>,
+        pub(super) used: f64,
+        pub(super) max: f64,
     }
     impl Turn {
         fn parsed(&self) -> Result<Value, serde_json::Error> {
             serde_json::from_str(&self.json)
+        }
+        fn lean_json(&self) -> Result<Value, FallbackReason> {
+            if self.context_bad {
+                return Err(FallbackReason::AssemblyError);
+            }
+            let mut map = serde_json::Map::new();
+            if let Some(name) = &self.model {
+                map.insert("model".into(), Value::String(name.to_string()));
+            }
+            if let Some(ctx) = &self.lean_context {
+                let tu = serde_json::to_value(&**ctx).map_err(|_| FallbackReason::AssemblyError)?;
+                map.insert("tokenUsage".into(), tu);
+            }
+            Ok(Value::Object(map))
         }
         fn model_value(&self) -> Value {
             match &self.model {
@@ -820,60 +871,9 @@ mod cache {
     /// only through `Attributor::owner`, which follows `parent_node_id`; a
     /// node's run id reaches no snapshot, so it is not kept.
     #[derive(Clone, Debug)]
-    struct Node {
-        node_id: Arc<str>,
-        parent_node_id: Option<Arc<str>>,
-    }
-    /// Node rows straight from SQLite. Decoding through `source::all` built a
-    /// temporary JSON object per row, interleaved with the node boxes that stay.
-    /// Those allocations kept extra heap resident after the read. Accepts and
-    /// rejects what `source::all` plus serde did: text is lossy UTF-8, NULL and blob
-    /// are absent, a number in an id column is an error.
-    fn node_rows(
-        db: &Connection,
-        sql: &str,
-        args: &[SqlValue],
-        pool: &mut Pool,
-    ) -> rusqlite::Result<Vec<Row>> {
-        use rusqlite::{params_from_iter, types::ValueRef};
-        let timed = source::timing::on().then(Instant::now);
-        let mut stmt = db.prepare_cached(sql)?;
-        let stepped = timed.map(|_| Instant::now());
-        let mut out = Vec::new();
-        let mut rows = stmt.query(params_from_iter(args.iter()))?;
-        while let Some(row) = rows.next()? {
-            let text = |i: usize| -> rusqlite::Result<Option<std::borrow::Cow<'_, str>>> {
-                match row.get_ref(i)? {
-                    ValueRef::Null | ValueRef::Blob(_) => Ok(None),
-                    ValueRef::Text(v) => Ok(Some(String::from_utf8_lossy(v))),
-                    other => Err(rusqlite::Error::InvalidColumnType(i, "text".into(), other.data_type())),
-                }
-            };
-            let must = |i: usize| {
-                text(i)?.ok_or_else(|| {
-                    rusqlite::Error::InvalidColumnType(i, "text".into(), rusqlite::types::Type::Null)
-                })
-            };
-            let id: i64 = row.get(0)?;
-            let owner = pool.intern(&must(1)?);
-            let node_id = pool.intern(&must(2)?);
-            let parent = text(3)?.map(|parent| pool.intern(&parent));
-            // Checked like the old decoder did; a node's run id reaches no snapshot.
-            text(4)?;
-            out.push(Row {
-                id,
-                owner,
-                data: Data::Node(Box::new(Node {
-                    node_id,
-                    parent_node_id: parent,
-                })),
-                position: 0,
-            });
-        }
-        if let (Some(prepare), Some(stepped)) = (timed, stepped) {
-            source::timing::query(sql, prepare, stepped, Instant::now(), out.len());
-        }
-        Ok(out)
+    pub(super) struct Node {
+        pub(super) node_id: Arc<str>,
+        pub(super) parent_node_id: Option<Arc<str>>,
     }
     /// Active and inactive node rows by node id, for `Attributor::owner` walks.
     /// A lookup only sees rows whose thread is active, as the oracle's
@@ -1015,83 +1015,89 @@ mod cache {
                 .filter(|id| !id.is_empty());
         }
     }
-    #[derive(Clone, Debug, Deserialize)]
-    struct Request {
-        node_id: String,
-        kind: String,
-        status: String,
-        created_at: Option<String>,
-        resolved_at: Option<String>,
-        async_input: i64,
+    #[derive(Clone, Debug)]
+    pub(super) struct Request {
+        pub(super) node_id: String,
+        pub(super) kind: String,
+        pub(super) status: String,
+        pub(super) created_at: Option<String>,
+        pub(super) resolved_at: Option<String>,
+        pub(super) async_input: i64,
     }
     /// Label, command, file and todo-list steps, read by rowid for a row inside
     /// a selection. They are always read, kept and dropped together.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct Text {
-        body: Body,
-        steps: Option<Arc<str>>,
+    pub(super) struct Text {
+        pub(super) body: Body,
+        pub(super) steps: Option<Arc<str>>,
     }
-    /// Keys for every turn-item. `text` is loaded only while the row is inside
-    /// an item cap, an event cap, or the plan set. The item's thread id is its
-    /// row's owner: both are the `thread_id` column of the same row.
+    /// Payload-derived keys and optional text, loaded by rowid only for rows
+    /// inside an item cap, an event cap, or the plan set.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct ItemPayload {
+        pub(super) started_at: Option<Stamp>,
+        pub(super) tool: Option<Arc<str>>,
+        pub(super) exit_code: Option<i32>,
+        pub(super) text: Option<Text>,
+    }
+    /// Inline keys for every kept turn-item. Payload-derived keys and text are
+    /// loaded only while the row is inside an item cap, an event cap, or the plan set.
     #[derive(Clone, Debug)]
-    struct Item {
-        run_id: Option<Arc<str>>,
-        node_id: Option<Arc<str>>,
-        provider_thread_id: Option<Arc<str>>,
-        kind: Arc<str>,
-        status: Arc<str>,
-        tool: Option<Arc<str>>,
-        updated_at: Stamp,
-        started_at: Option<Stamp>,
-        ordinal: i64,
-        exit_code: Option<i32>,
-        text: Option<Box<Text>>,
+    pub(super) struct Item {
+        pub(super) run_id: Option<Arc<str>>,
+        pub(super) node_id: Option<Arc<str>>,
+        pub(super) provider_thread_id: Option<Arc<str>>,
+        pub(super) kind: Arc<str>,
+        pub(super) status: Arc<str>,
+        pub(super) updated_at: Stamp,
+        pub(super) ordinal: i64,
+        pub(super) payload: Option<Box<ItemPayload>>,
     }
     impl Item {
-        /// Compares every key but the thread id, which the caller compares as
-        /// the row owner.
-        fn keys_eq(&self, other: &Self) -> bool {
+        /// Compares every inline key (thread id is compared by row owner).
+        fn inline_keys_eq(&self, other: &Self) -> bool {
             self.run_id == other.run_id
                 && self.node_id == other.node_id
                 && self.provider_thread_id == other.provider_thread_id
                 && self.kind == other.kind
                 && self.status == other.status
                 && self.updated_at == other.updated_at
-                && self.started_at == other.started_at
-                && self.tool == other.tool
-                && self.exit_code == other.exit_code
                 && self.ordinal == other.ordinal
         }
-        /// A keys-only read (`text` is `None`) is not a change and must not
-        /// wipe text already held for a selected row. Text on both sides is
-        /// compared.
+        /// An inline-only read (`payload` is `None`) is not a change and must not
+        /// wipe payload keys/text already held for a selected row.
         fn same_projected(&self, other: &Self) -> bool {
-            if !self.keys_eq(other) {
+            if !self.inline_keys_eq(other) {
                 return false;
             }
-            match (&self.text, &other.text) {
-                (Some(left), Some(right)) => left == right,
+            match (&self.payload, &other.payload) {
+                (Some(left), Some(right)) => {
+                    left.started_at == right.started_at
+                        && left.tool == right.tool
+                        && left.exit_code == right.exit_code
+                        && match (&left.text, &right.text) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => true,
+                        }
+                }
                 _ => true,
             }
         }
-        fn matches_text(&self, owner: &str, text: &ItemText) -> bool {
-            opt_same(&self.run_id, &text.run_id)
-                && opt_same(&self.node_id, &text.node_id)
-                && opt_same(&self.provider_thread_id, &text.provider_thread_id)
-                && opt_same(&self.tool, &text.tool)
-                && owner == text.thread_id
-                && self.kind.as_ref() == text.kind
-                && self.status.as_ref() == text.status
-                && self.updated_at == text.updated_at
-                && self.started_at == text.started_at
-                && self.exit_code == text.exit_code
-                && self.ordinal == text.ordinal
+        fn matches_inline(&self, owner: &str, read: &ItemPayloadRead) -> bool {
+            opt_same(&self.run_id, &read.run_id)
+                && opt_same(&self.node_id, &read.node_id)
+                && opt_same(&self.provider_thread_id, &read.provider_thread_id)
+                && owner == read.thread_id
+                && self.kind.as_ref() == read.kind
+                && self.status.as_ref() == read.status
+                && self.updated_at == read.updated_at
+                && self.ordinal == read.ordinal
         }
         /// The item without label, command or file, for the status-only reader,
         /// which never reads them (`status_view`).
-        fn bare(&self, owner: &str) -> crate::model::Item {
-            crate::model::Item {
+        fn bare(&self, owner: &str) -> Result<crate::model::Item, FallbackReason> {
+            let payload = self.payload.as_ref().ok_or(FallbackReason::TextDrift)?;
+            Ok(crate::model::Item {
                 thread_id: owner.to_owned(),
                 run_id: self.run_id.as_ref().map(|text| text.to_string()),
                 node_id: self.node_id.as_ref().map(|text| text.to_string()),
@@ -1099,16 +1105,17 @@ mod cache {
                 kind: self.kind.to_string(),
                 status: self.status.to_string(),
                 updated_at: self.updated_at.text_owned(),
-                started_at: self.started_at.as_ref().map(Stamp::text_owned),
+                started_at: payload.started_at.as_ref().map(Stamp::text_owned),
                 label: String::new(),
                 command: String::new(),
                 file: String::new(),
-                tool: self.tool.as_ref().map(|text| text.to_string()),
-                exit_code: self.exit_code,
-            }
+                tool: payload.tool.as_ref().map(|text| text.to_string()),
+                exit_code: payload.exit_code,
+            })
         }
         fn materialize(&self, owner: &str) -> Result<crate::model::Item, FallbackReason> {
-            let body = &self.text.as_ref().ok_or(FallbackReason::TextDrift)?.body;
+            let payload = self.payload.as_ref().ok_or(FallbackReason::TextDrift)?;
+            let body = &payload.text.as_ref().ok_or(FallbackReason::TextDrift)?.body;
             Ok(crate::model::Item {
                 thread_id: owner.to_owned(),
                 run_id: self.run_id.as_ref().map(|text| text.to_string()),
@@ -1120,12 +1127,12 @@ mod cache {
                 kind: self.kind.to_string(),
                 status: self.status.to_string(),
                 updated_at: self.updated_at.text_owned(),
-                started_at: self.started_at.as_ref().map(Stamp::text_owned),
+                started_at: payload.started_at.as_ref().map(Stamp::text_owned),
                 label: body.label.to_string(),
                 command: body.command.to_string(),
                 file: body.file.to_string(),
-                tool: self.tool.as_ref().map(|text| text.to_string()),
-                exit_code: self.exit_code,
+                tool: payload.tool.as_ref().map(|text| text.to_string()),
+                exit_code: payload.exit_code,
             })
         }
     }
@@ -1133,7 +1140,7 @@ mod cache {
     /// size (a node is two ids, a turn item a dozen fields), and an inline enum
     /// made every node row as large as a turn item.
     #[derive(Clone, Debug)]
-    enum Data {
+    pub(super) enum Data {
         Thread(Box<Thread>),
         Run(Box<Run>),
         Subagent(Box<Payload>),
@@ -1145,11 +1152,11 @@ mod cache {
     }
     /// `owner` is the row's `thread_id` column, interned.
     #[derive(Clone, Debug)]
-    struct Row {
-        id: i64,
-        owner: Arc<str>,
-        data: Data,
-        position: usize,
+    pub(super) struct Row {
+        pub(super) id: i64,
+        pub(super) owner: Arc<str>,
+        pub(super) data: Data,
+        pub(super) position: usize,
     }
     #[derive(Clone, Default)]
     struct Table {
@@ -1161,14 +1168,22 @@ mod cache {
         /// its nodes; inserting row by row leaves them about half full. Equal
         /// rowids keep the last row, as repeated `insert` would.
         fn build(rows: Vec<Row>) -> Self {
-            let mut owners: BTreeMap<Arc<str>, Vec<i64>> = BTreeMap::new();
             let rows: BTreeMap<i64, Row> = rows.into_iter().map(|row| (row.id, row)).collect();
+            let mut owners: HashMap<Arc<str>, Vec<i64>, std::hash::BuildHasherDefault<poll1::FnvHasher>> =
+                HashMap::default();
             for row in rows.values() {
-                owners.entry(Arc::clone(&row.owner)).or_default().push(row.id);
+                if let Some(ids) = owners.get_mut(&row.owner) {
+                    ids.push(row.id);
+                } else {
+                    owners.insert(Arc::clone(&row.owner), vec![row.id]);
+                }
             }
             Self {
                 rows,
-                owners: owners.into_iter().map(|(owner, ids)| (owner, ids.into_iter().collect())).collect(),
+                owners: owners
+                    .into_iter()
+                    .map(|(owner, ids)| (owner, ids.into_iter().collect()))
+                    .collect(),
             }
         }
         fn remove_owner(&mut self, owner: &str) {
@@ -1201,11 +1216,11 @@ mod cache {
             Some(row)
         }
     }
-    #[derive(Clone, Debug, Deserialize)]
-    struct Project {
-        project_id: String,
-        title: String,
-        workspace_root: String,
+    #[derive(Clone, Debug)]
+    pub(super) struct Project {
+        pub(super) project_id: String,
+        pub(super) title: String,
+        pub(super) workspace_root: String,
     }
     fn same_projects(left: &BTreeMap<String, Project>, right: &BTreeMap<String, Project>) -> bool {
         left.len() == right.len()
@@ -1237,6 +1252,11 @@ mod cache {
                     && a.ordinal == b.ordinal
                     && a.started_at == b.started_at
                     && a.completed_at == b.completed_at
+                    && a.model_bad == b.model_bad
+                    && a.identity_bad == b.identity_bad
+                    && a.context_bad == b.context_bad
+                    && a.model == b.model
+                    && a.lean_context == b.lean_context
             }
             (Data::Node(a), Data::Node(b)) => {
                 a.node_id == b.node_id && a.parent_node_id == b.parent_node_id
@@ -1292,9 +1312,9 @@ mod cache {
     #[derive(Debug)]
     pub(super) struct Pending {
         pub(super) full: bool,
-        owners: BTreeSet<String>,
-        tables: Vec<Vec<Row>>,
-        projects: BTreeMap<String, Project>,
+        pub(super) owners: BTreeSet<String>,
+        pub(super) tables: Vec<Vec<Row>>,
+        pub(super) projects: BTreeMap<String, Project>,
         pub rows: usize,
     }
     // Narrow projection expressions plus rowid identity. Request capability
@@ -1316,7 +1336,7 @@ mod cache {
             (table, format!("SELECT rowid AS cache_rowid,thread_id,{fields} FROM orchestration_v2_projection_{table}"))
         }).collect()
     }
-    fn request_query(fields: &str) -> String {
+    pub(super) fn request_query(fields: &str) -> String {
         format!("SELECT rowid AS cache_rowid,thread_id,{fields} FROM orchestration_v2_projection_runtime_requests")
     }
     fn payload_sql(table: &str) -> String {
@@ -1340,245 +1360,6 @@ mod cache {
             fields = source::item_fields()
         )
     }
-    fn decode(table: usize, value: Value, pool: &mut Pool) -> Result<Row, serde_json::Error> {
-        let id = value["cache_rowid"].as_i64().expect("SQLite rowid");
-        let owner = serde_json::from_value::<String>(value["thread_id"].clone())?;
-        let data = match table {
-            0 => Data::Thread(Box::new(serde_json::from_value(value)?)),
-            1 => Data::Run(Box::new(serde_json::from_value(value)?)),
-            2 => Data::Subagent(Box::new(serde_json::from_value(value)?)),
-            3 => Data::Provider(Box::new(serde_json::from_value(value)?)),
-            4 => unreachable!("turns are decoded by turn_rows"),
-            5 => unreachable!("nodes are decoded by node_rows"),
-            6 => Data::Request(Box::new(serde_json::from_value(value)?)),
-            7 => unreachable!("turn-items are decoded by item_rows"),
-            _ => unreachable!(),
-        };
-        Ok(Row {
-            id,
-            owner: pool.intern(&owner),
-            data,
-            position: 0,
-        })
-    }
-    fn load_rows(
-        db: &Connection,
-        path: &Path,
-        index: usize,
-        sql: &str,
-        args: &[SqlValue],
-        pool: &mut Pool,
-    ) -> Result<Vec<Row>, SourceError> {
-        if index == 7 {
-            return item_rows(db, sql, args, pool).map_err(|e| error(path, e));
-        }
-        if index == 4 {
-            return turn_rows(db, sql, args, pool).map_err(|e| error(path, e));
-        }
-        if index == 5 {
-            return node_rows(db, sql, args, pool).map_err(|e| error(path, e));
-        }
-        source::all(db, sql, args)
-            .map_err(|e| error(path, e))?
-            .into_iter()
-            .map(|value| decode(index, value, pool).map_err(|e| error(path, e)))
-            .collect()
-    }
-    fn turn_rows(
-        db: &Connection,
-        sql: &str,
-        args: &[SqlValue],
-        pool: &mut Pool,
-    ) -> rusqlite::Result<Vec<Row>> {
-        use rusqlite::{params_from_iter, types::ValueRef};
-        let mut stmt = db.prepare_cached(sql)?;
-        let mut out = Vec::new();
-        let mut rows = stmt.query(params_from_iter(args.iter()))?;
-        while let Some(row) = rows.next()? {
-            let text = |i: usize| match row.get_ref(i)? {
-                ValueRef::Null => Ok(None),
-                ValueRef::Text(v) => Ok(Some(String::from_utf8_lossy(v).into_owned())),
-                other => Err(rusqlite::Error::InvalidColumnType(
-                    i,
-                    "text".into(),
-                    other.data_type(),
-                )),
-            };
-            let must = |i: usize| {
-                text(i)?.ok_or_else(|| {
-                    rusqlite::Error::InvalidColumnType(i, "text".into(), rusqlite::types::Type::Null)
-                })
-            };
-            let owner = must(1)?;
-            let json = must(2)?;
-            let provider_thread_id = must(3)?;
-            let parsed: Value = serde_json::from_str(&json).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            })?;
-            let model = &parsed["model"];
-            let model_bad = !model.is_null() && !model.is_string();
-            let model = model.as_str().map(|text| pool.intern(text));
-            let identity_bad = parsed["providerThreadId"].as_str() != Some(provider_thread_id.as_str());
-            let usage = parsed.get("tokenUsage").filter(|value| value.is_object());
-            let (used, max) = usage
-                .map(|usage| (source::number(usage, "usedTokens"), source::number(usage, "maxTokens")))
-                .unwrap_or((0., 0.));
-            out.push(Row {
-                id: row.get(0)?,
-                owner: pool.intern(&owner),
-                position: 0,
-                data: Data::Turn(Box::new(Turn {
-                    json: Arc::from(json),
-                    provider_thread_id: pool.intern(&provider_thread_id),
-                    ordinal: row.get(4)?,
-                    started_at: stamp_opt(text(5)?),
-                    completed_at: stamp_opt(text(6)?),
-                    model_bad,
-                    identity_bad,
-                    model,
-                    used,
-                    max,
-                })),
-            });
-        }
-        Ok(out)
-    }
-    /// Turn-items skip the generic JSON map. The key scan omits label, command,
-    /// file and steps; those are read later, by rowid, for selected rows only.
-    fn item_rows(
-        db: &Connection,
-        sql: &str,
-        args: &[SqlValue],
-        pool: &mut Pool,
-    ) -> rusqlite::Result<Vec<Row>> {
-        use rusqlite::{params_from_iter, types::ValueRef};
-        let timed = source::timing::on().then(Instant::now);
-        let mut stmt = db.prepare_cached(sql)?;
-        let stepped = timed.map(|_| Instant::now());
-        let mut out = Vec::new();
-        let mut rows = stmt.query(params_from_iter(args.iter()))?;
-        while let Some(row) = rows.next()? {
-            let text = |i: usize| match row.get_ref(i)? {
-                ValueRef::Null => Ok(None),
-                ValueRef::Text(v) => Ok(Some(String::from_utf8_lossy(v).into_owned())),
-                other => Err(rusqlite::Error::InvalidColumnType(
-                    i,
-                    "text".into(),
-                    other.data_type(),
-                )),
-            };
-            let must = |i: usize| {
-                text(i)?.ok_or_else(|| {
-                    rusqlite::Error::InvalidColumnType(i, "text".into(), rusqlite::types::Type::Null)
-                })
-            };
-            let exit = match row.get_ref(11)? {
-                ValueRef::Null => None,
-                ValueRef::Integer(v) => Some(
-                    i32::try_from(v).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            11,
-                            rusqlite::types::Type::Integer,
-                            Box::new(err),
-                        )
-                    })?,
-                ),
-                other => {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        11,
-                        "integer".into(),
-                        other.data_type(),
-                    ));
-                }
-            };
-            let updated = must(8)?;
-            let started = text(9)?;
-            // Column 2 is the item's thread_id, the same column as the owner.
-            must(2)?;
-            out.push(Row {
-                id: row.get(0)?,
-                owner: pool.intern(&must(1)?),
-                position: 0,
-                data: Data::Item(Box::new(Item {
-                    run_id: pool.intern_opt(text(3)?),
-                    node_id: pool.intern_opt(text(4)?),
-                    provider_thread_id: pool.intern_opt(text(5)?),
-                    kind: pool.intern(&must(6)?),
-                    status: pool.intern(&must(7)?),
-                    updated_at: Stamp::parse(&updated),
-                    started_at: stamp_opt(started),
-                    tool: pool.intern_opt(text(10)?),
-                    exit_code: exit,
-                    ordinal: row.get(12)?,
-                    text: None,
-                })),
-            });
-        }
-        if let (Some(prepare), Some(stepped)) = (timed, stepped) {
-            source::timing::query(sql, prepare, stepped, Instant::now(), out.len());
-        }
-        Ok(out)
-    }
-    /// By-rowid text. Column order is rowid, the full item fields, ordinal, steps.
-    fn load_item_text(db: &Connection, path: &Path, ids: &[i64]) -> Result<Vec<ItemText>, FallbackReason> {
-        use rusqlite::{params_from_iter, types::ValueRef};
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let sql = item_text_query(ids.len());
-        let mut stmt = db.prepare_cached(&sql).map_err(|err| {
-            let _ = (path, err);
-            FallbackReason::TextDrift
-        })?;
-        let args = ids.iter().copied().map(SqlValue::Integer);
-        let mut rows = stmt.query(params_from_iter(args)).map_err(|_| FallbackReason::TextDrift)?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|_| FallbackReason::TextDrift)? {
-            let text = |i: usize| match row.get_ref(i).map_err(|_| FallbackReason::TextDrift)? {
-                ValueRef::Null => Ok(None),
-                ValueRef::Text(v) => Ok(Some(String::from_utf8_lossy(v).into_owned())),
-                _ => Err(FallbackReason::TextDrift),
-            };
-            let must = |i: usize| text(i)?.ok_or(FallbackReason::TextDrift);
-            let exit = match row.get_ref(10).map_err(|_| FallbackReason::TextDrift)? {
-                ValueRef::Null => None,
-                ValueRef::Integer(v) => {
-                    Some(i32::try_from(v).map_err(|_| FallbackReason::TextDrift)?)
-                }
-                _ => return Err(FallbackReason::TextDrift),
-            };
-            let steps = match row.get_ref(15).map_err(|_| FallbackReason::TextDrift)? {
-                ValueRef::Text(v) => Some(Arc::<str>::from(String::from_utf8_lossy(v).as_ref())),
-                ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) | ValueRef::Blob(_) => None,
-            };
-            let updated = must(7)?;
-            out.push(ItemText {
-                rowid: row.get(0).map_err(|_| FallbackReason::TextDrift)?,
-                thread_id: must(1)?,
-                run_id: text(2)?,
-                node_id: text(3)?,
-                provider_thread_id: text(4)?,
-                kind: must(5)?,
-                status: must(6)?,
-                updated_at: Stamp::parse(&updated),
-                started_at: text(8)?.map(|value| Stamp::parse(&value)),
-                tool: text(9)?,
-                exit_code: exit,
-                body: Body {
-                    label: Arc::from(text(11)?.unwrap_or_default()),
-                    command: Arc::from(text(12)?.unwrap_or_default()),
-                    file: Arc::from(text(13)?.unwrap_or_default()),
-                },
-                ordinal: row.get(14).map_err(|_| FallbackReason::TextDrift)?,
-                steps,
-            });
-        }
-        Ok(out)
-    }
     impl Pending {
         pub fn read(
             db: &Connection,
@@ -1586,80 +1367,21 @@ mod cache {
             owners: Option<&BTreeSet<String>>,
             pool: &mut Pool,
         ) -> Result<Self, SourceError> {
-            let mut tables = Vec::new();
-            let mut count = 0;
-            for (index, (_, mut sql)) in queries().into_iter().enumerate() {
-                if index == 6 {
-                    let fields = source::request_fields(db).map_err(|e| error(path, e))?;
-                    sql = request_query(&fields);
-                }
-                let mut decoded = Vec::new();
-                // One bound id per indexed read, independent of SQLite's variable
-                // limit and of the number of threads in a burst.
-                if let Some(owners) = owners {
-                    let sql = owner_query(index, &sql);
-                    for owner in owners {
-                        decoded.extend(load_rows(
-                            db,
-                            path,
-                            index,
-                            &sql,
-                            &[SqlValue::Text(owner.clone())],
-                            pool,
-                        )?);
-                    }
-                } else if index == 2 || index == 6 || index == 7 {
-                    // A full table scan does not expose the per-owner index slice.
-                    // Discover owners, then use the identical owner query as a refresh.
-                    // The projection itself is not parsed here: that temporary JSON
-                    // was most of a full read's allocator peak.
-                    let ids = distinct_owners(db, TABLES[index]).map_err(|e| error(path, e))?;
-                    count += ids.len();
-                    let sql = owner_query(index, &sql);
-                    for id in ids {
-                        decoded.extend(load_rows(
-                            db,
-                            path,
-                            index,
-                            &sql,
-                            &[SqlValue::Text(id)],
-                            pool,
-                        )?);
-                    }
-                } else {
-                    decoded = load_rows(db, path, index, &sql, &[], pool)?;
-                }
-                count += decoded.len();
-                let mut positions = BTreeMap::<Arc<str>, usize>::new();
-                for row in &mut decoded {
-                    let next = positions.entry(Arc::clone(&row.owner)).or_default();
-                    row.position = *next;
-                    *next += 1;
-                }
-                tables.push(decoded);
-            }
-            let projects = source::all(
-                db,
-                "SELECT project_id,title,workspace_root FROM projection_projects",
-                &[],
-            )
-            .map_err(|e| error(path, e))?;
-            count += projects.len();
-            let projects = projects
-                .into_iter()
-                .map(|v| serde_json::from_value::<Project>(v))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| error(path, e))?
-                .into_iter()
-                .map(|p| (p.project_id.clone(), p))
-                .collect();
-            Ok(Self {
-                full: owners.is_none(),
-                owners: owners.cloned().unwrap_or_default(),
-                tables,
-                projects,
-                rows: count,
-            })
+            let inline_ok = poll1::item_inline_query_ok(db);
+            Self::read_scoped(db, path, owners, pool, false, inline_ok, None, None)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn read_scoped(
+            db: &Connection,
+            path: &Path,
+            owners: Option<&BTreeSet<String>>,
+            pool: &mut Pool,
+            lean: bool,
+            inline_ok: bool,
+            now: Option<f64>,
+            idx_and_items: Option<(&Select, &BTreeMap<i64, Row>)>,
+        ) -> Result<Self, SourceError> {
+            poll1::read_pending_scoped(db, path, owners, pool, lean, inline_ok, now, idx_and_items)
         }
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1692,7 +1414,7 @@ mod cache {
         (oracle == per_thread).then_some(oracle)
     }
     use source::REQUEST_FILTER;
-    fn distinct_owners(db: &Connection, table: &str) -> rusqlite::Result<BTreeSet<String>> {
+    pub(super) fn distinct_owners(db: &Connection, table: &str) -> rusqlite::Result<BTreeSet<String>> {
         let sql = format!("SELECT DISTINCT thread_id FROM orchestration_v2_projection_{table}");
         let mut stmt = db.prepare_cached(&sql)?;
         let mut rows = stmt.query([])?;
@@ -1702,7 +1424,7 @@ mod cache {
         }
         Ok(ids)
     }
-    fn owner_query(index: usize, sql: &str) -> String {
+    pub(super) fn owner_query(index: usize, sql: &str) -> String {
         let filter = if index == 6 {
             format!(" AND {REQUEST_FILTER}")
         } else {
@@ -1710,7 +1432,7 @@ mod cache {
         };
         format!("{sql} WHERE thread_id=?{filter}")
     }
-    fn classify(
+    pub(super) fn classify(
         db: &Connection,
         table: &str,
         constraint: &str,
@@ -2084,8 +1806,7 @@ mod cache {
         }
     }
     fn canonical_stamp(text: &str) -> bool {
-        text.len() == 24
-            && crate::model::ms(Some(text)).is_some_and(|stamp| source::iso(stamp) == text)
+        poll1::parse_canonical_utc_ms(text).is_some()
     }
     fn stamp_key(mode: Option<&EncounterOrder>, row: &Row, updated: &Stamp) -> StampKey {
         match mode {
@@ -2107,10 +1828,10 @@ mod cache {
     /// each poll; only turn-items stay in these trees, because that is the table
     /// whose full scan dominated a poll.
     #[derive(Clone, Default)]
-    struct Select {
+    pub(super) struct Select {
         ready: bool,
         inputs_ready: bool,
-        since: String,
+        pub(super) since: String,
         bad_events: u32,
 
         event_tie_groups: u32,
@@ -2141,9 +1862,9 @@ mod cache {
         by_run: HashMap<String, HashSet<i64>>,
         plan_by_run: HashMap<String, HashSet<i64>>,
         runless: HashMap<String, HashSet<i64>>,
-        active: HashSet<String>,
+        pub(super) active: HashSet<String>,
         latest_keys: HashSet<String>,
-        run_refs: HashSet<String>,
+        pub(super) run_refs: HashSet<String>,
         item_members: HashSet<i64>,
         event_members: HashSet<i64>,
         plan_members: HashSet<i64>,
@@ -2159,14 +1880,18 @@ mod cache {
         span_floor_bad: bool,
         span_floor_ms: f64,
     }
-    struct Elig {
-        active: HashSet<String>,
-        latest_keys: HashSet<String>,
-        run_refs: HashSet<String>,
+    pub(super) struct Elig {
+        pub(super) active: HashSet<String>,
+        pub(super) latest_keys: HashSet<String>,
+        pub(super) run_refs: HashSet<String>,
     }
-    fn eligibility(tables: &[Table; 8]) -> Elig {
+    pub(super) fn eligibility_rows<'a>(
+        threads: impl Iterator<Item = &'a Row>,
+        runs: impl Iterator<Item = &'a Row>,
+        subs: impl Iterator<Item = &'a Row>,
+    ) -> Elig {
         let mut active = HashSet::new();
-        for row in tables[0].rows.values() {
+        for row in threads {
             if let Data::Thread(t) = &row.data {
                 if t.archived_at.is_none() && t.deleted_at.is_none() {
                     if let Some(id) = t.data.payload.get("id").and_then(|v| v.as_str()) {
@@ -2176,7 +1901,7 @@ mod cache {
             }
         }
         let mut best: HashMap<String, (i64, String)> = HashMap::new();
-        for row in tables[1].rows.values() {
+        for row in runs {
             let Data::Run(v) = &row.data else { continue };
             if !active.contains(row.owner.as_ref()) {
                 continue;
@@ -2205,7 +1930,7 @@ mod cache {
                 run_refs.insert(id.1.clone());
             }
         }
-        for row in tables[2].rows.values() {
+        for row in subs {
             if !active.contains(row.owner.as_ref()) {
                 continue;
             }
@@ -2218,6 +1943,13 @@ mod cache {
             }
         }
         Elig { active, latest_keys, run_refs }
+    }
+    fn eligibility(tables: &[Table; 8]) -> Elig {
+        eligibility_rows(
+            tables[0].rows.values(),
+            tables[1].rows.values(),
+            tables[2].rows.values(),
+        )
     }
     impl Select {
         fn item_visible(&self, owner: &str, kind: &str, run_id: Option<&str>) -> bool {
@@ -2390,27 +2122,73 @@ mod cache {
             }
         }
         fn index_item(&mut self, row: &Row) {
+            self.index_item_inner(row, true);
+        }
+        fn index_item_bulk(&mut self, row: &Row) {
+            self.index_item_inner(row, false);
+        }
+        fn index_item_inner(&mut self, row: &Row, maintain_prefix: bool) {
             let Data::Item(v) = &row.data else { return };
             let run = v.run_id.as_deref().filter(|id| !id.is_empty());
             if source::is_toolish(&v.kind) {
                 if let Some(run) = run {
-                    self.by_run.entry(run.to_string()).or_default().insert(row.id);
+                    if let Some(set) = self.by_run.get_mut(run) {
+                        set.insert(row.id);
+                    } else {
+                        let mut set = HashSet::new();
+                        set.insert(row.id);
+                        self.by_run.insert(run.to_owned(), set);
+                    }
                 } else if v.run_id.is_none() {
-                    self.runless.entry(row.owner.to_string()).or_default().insert(row.id);
+                    if let Some(set) = self.runless.get_mut(row.owner.as_ref()) {
+                        set.insert(row.id);
+                    } else {
+                        let mut set = HashSet::new();
+                        set.insert(row.id);
+                        self.runless.insert(row.owner.to_string(), set);
+                    }
                 }
                 if self.item_visible(&row.owner, &v.kind, run) {
-                    self.insert_item(row);
+                    if maintain_prefix {
+                        self.insert_item(row);
+                    } else if !self.item_ids.contains(&row.id) {
+                        let key = item_key(self.item_mode.as_ref(), row);
+                        self.item_ids.insert(row.id);
+                        self.items.insert(key);
+                    }
                 }
             }
             if source::is_event_kind(&v.kind)
                 && self.active.contains(row.owner.as_ref())
                 && stamp_ge(&v.updated_at, &self.since)
             {
-                self.insert_event(row, &v.updated_at);
+                if maintain_prefix {
+                    self.insert_event(row, &v.updated_at);
+                } else if !self.event_at.contains_key(&row.id) {
+                    let updated = &v.updated_at;
+                    if !updated.is_canonical() {
+                        self.bad_events += 1;
+                    }
+                    let group = self.event_group.entry(updated.clone()).or_default();
+                    *group += 1;
+                    if *group == 2 {
+                        self.event_tie_groups += 1;
+                    }
+                    let key = stamp_key(self.event_mode.as_ref(), row, updated);
+                    self.event_ids.insert(row.id);
+                    self.event_at.insert(row.id, key.clone());
+                    self.events.insert(key, row.id);
+                }
             }
             if v.kind.as_ref() == "todo_list" {
                 if let Some(run) = run {
-                    self.plan_by_run.entry(run.to_string()).or_default().insert(row.id);
+                    if let Some(set) = self.plan_by_run.get_mut(run) {
+                        set.insert(row.id);
+                    } else {
+                        let mut set = HashSet::new();
+                        set.insert(row.id);
+                        self.plan_by_run.insert(run.to_owned(), set);
+                    }
                 }
                 if run.is_some_and(|id| self.run_refs.contains(id)) {
                     self.insert_plan(row, &v.updated_at);
@@ -2709,7 +2487,7 @@ mod cache {
         match &row.data {
             Data::Node(node) => {
                 if add {
-                    nodes.add(row.id, pool.intern(&row.owner), node);
+                    nodes.add(row.id, Arc::clone(&row.owner), node);
                 } else {
                     nodes.remove(row.id, node);
                 }
@@ -2726,7 +2504,7 @@ mod cache {
             _ => {}
         }
     }
-    fn thread_active(thread: &Thread) -> bool {
+    pub(super) fn thread_active(thread: &Thread) -> bool {
         thread.archived_at.is_none() && thread.deleted_at.is_none()
     }
     fn same_links(left: &Thread, right: &Thread) -> bool {
@@ -2885,13 +2663,17 @@ mod cache {
                     if !turn_keys.insert((v.provider_thread_id.as_ref(), v.ordinal)) {
                         return Err(FallbackReason::ProviderOrdinalTie);
                     }
-                    let parsed = v.parsed().map_err(|_| FallbackReason::AssemblyError)?;
+                    let parsed = if self.lean {
+                        v.lean_json()?
+                    } else {
+                        v.parsed().map_err(|_| FallbackReason::AssemblyError)?
+                    };
                     turns
                         .entry(v.provider_thread_id.to_string())
                         .or_insert(parsed.clone());
                     let count = counts.entry(v.provider_thread_id.as_ref()).or_insert(0);
                     *count += 1;
-                    if *count <= 160 {
+                    if *count <= 160 && !self.lean {
                         history.push(json!({
                             "provider_thread_id": v.provider_thread_id.as_ref(),
                             "thread_id": r.owner,
@@ -3084,7 +2866,7 @@ mod cache {
                     spans.push(json!({"thread_id":r.owner,"requested_at":v.requested_at,"completed_at":v.completed_at,"started_at":v.data.payload["startedAt"]}));
                 }
             }
-            let paint = |v: &Item, r: &Row| if self.lean { Ok(v.bare(&r.owner)) } else { v.materialize(&r.owner) };
+            let paint = |v: &Item, r: &Row| if self.lean { v.bare(&r.owner) } else { v.materialize(&r.owner) };
             let painted_items = items
                 .iter()
                 .map(|(v, r)| paint(v, r))
@@ -3106,10 +2888,23 @@ mod cache {
                     .chain(spans.iter().filter_map(|v| v["completed_at"].as_str())),
                 now,
             );
-            if plans.iter().any(|(v, _)| v.text.is_none()) {
-                return Err(FallbackReason::TextDrift);
+            let mut plan_rows = Vec::with_capacity(plans.len());
+            for (v, r) in plans {
+                let text = v
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.text.as_ref())
+                    .ok_or(FallbackReason::TextDrift)?;
+                plan_rows.push(json!({
+                    "thread_id": r.owner.as_ref(),
+                    "run_id": v.run_id.as_deref(),
+                    "node_id": v.node_id.as_deref(),
+                    "provider_thread_id": v.provider_thread_id.as_deref(),
+                    "updated_at": v.updated_at.text_owned(),
+                    "steps": text.steps.as_deref(),
+                }));
             }
-            let plans = plans.into_iter().map(|(v,r)| json!({"thread_id":r.owner.as_ref(),"run_id":v.run_id.as_deref(),"node_id":v.node_id.as_deref(),"provider_thread_id":v.provider_thread_id.as_deref(),"updated_at":v.updated_at.text_owned(),"steps":v.text.as_ref().and_then(|text| text.steps.as_deref())})).collect();
+            let plans = plan_rows;
             drop(selection);
             let mut snapshot = source::assemble(
                 threads, latest, subs, providers, turns, nodes, projects, requests, items, events,
@@ -3157,11 +2952,14 @@ mod cache {
             idx.since = source::iso(now - source::WINDOW);
             idx.store_elig(eligibility(&self.tables));
             for row in self.tables[7].rows.values() {
-                idx.index_item(row);
+                idx.index_item_bulk(row);
             }
+            idx.item_prefix = idx.items.iter().take(3000).cloned().collect();
+            idx.rebuild_event_prefix();
             idx.ready = true;
             self.idx = idx;
             self.nodes = NodeIndex::default();
+            self.nodes.map.reserve(self.tables[5].rows.len());
             self.provider_rows.clear();
             self.turn_rows.clear();
             self.bad_turns.clear();
@@ -3193,7 +2991,7 @@ mod cache {
         }
         /// Apply a read in place. The undo is the previous rows of the owners
         /// that changed. A full refresh releases the previous cache first.
-        pub(super) fn stage(&mut self, db: &Connection, pending: Pending, now: f64) -> Undo {
+        pub(super) fn stage(&mut self, db: &Connection, pending: Pending, now: f64, inline_ok: bool) -> Undo {
             if pending.full || !self.idx.ready {
                 let pool = std::mem::take(&mut self.pool);
                 let drift = self.force_text_drift;
@@ -3249,7 +3047,7 @@ mod cache {
             if !missing.is_empty() {
                 let sql = format!("{} WHERE rowid=?", queries()[1].1);
                 for id in missing {
-                    match load_rows(db, Path::new(""), 1, &sql, &[SqlValue::Integer(id)], &mut self.pool) {
+                    match poll1::load_rows(db, Path::new(""), 1, &sql, &[SqlValue::Integer(id)], &mut self.pool) {
                         Ok(rows) => {
                             moved_read += rows.len();
                             tables[1].extend(rows);
@@ -3347,7 +3145,7 @@ mod cache {
                 let gained: Vec<String> = self.idx.run_refs.difference(&old_refs).cloned().collect();
                 let lost: Vec<String> = old_refs.difference(&self.idx.run_refs).cloned().collect();
                 // A newly selected run's rows may not be cached: read them.
-                match self.fetch_runs(db, &gained) {
+                match self.fetch_runs(db, &gained, inline_ok) {
                     Ok(rows) => {
                         read += rows.len();
                         for row in rows {
@@ -3469,18 +3267,29 @@ mod cache {
                 }
             }
         }
-        /// Every turn-item row of each run, keys only, by run id: the same
-        /// allowlisted expressions as an owner read. Their encounter position
-        /// is unknown and left 0. It is read only for the event cap, and a row
-        /// the event cap can take is never missing from the cache (`keeps`).
-        fn fetch_runs(&mut self, db: &Connection, runs: &[String]) -> rusqlite::Result<Vec<Row>> {
+        /// Every turn-item row of each run, keys only, by run id: the columns an
+        /// owner read takes. Their encounter position is unknown; the one kept is
+        /// the row's place in this read. It is read only for the event cap, and a
+        /// row the event cap can take is never missing from the cache (`keeps`).
+        fn fetch_runs(&mut self, db: &Connection, runs: &[String], inline_ok: bool) -> rusqlite::Result<Vec<Row>> {
             let mut out = Vec::new();
             if runs.is_empty() {
                 return Ok(out);
             }
-            let sql = run_query();
+            let sql = if inline_ok {
+                poll1::run_inline_query()
+            } else {
+                run_query()
+            };
             for run in runs {
-                out.extend(item_rows(db, &sql, &[SqlValue::Text(run.clone())], &mut self.pool)?);
+                out.extend(poll1::item_rows_scoped(
+                    db,
+                    &sql,
+                    &[SqlValue::Text(run.clone())],
+                    inline_ok,
+                    &mut self.pool,
+                    None,
+                )?);
             }
             Ok(out)
         }
@@ -3517,13 +3326,15 @@ mod cache {
             path: &Path,
             refreshed: &BTreeSet<String>,
         ) -> Result<usize, FallbackReason> {
-            if !self.idx.ready || self.lean {
+            if !self.idx.ready {
                 return Ok(0);
             }
             let mut selected = HashSet::new();
             selected.extend(self.idx.item_prefix.iter().map(|key| key.rowid));
             selected.extend(self.idx.event_prefix.iter().copied());
-            selected.extend(self.idx.plan_at.keys().copied());
+            if !self.lean {
+                selected.extend(self.idx.plan_at.keys().copied());
+            }
             let stale: Vec<i64> = self
                 .text_held
                 .iter()
@@ -3534,14 +3345,14 @@ mod cache {
                 self.text_held.remove(&id);
                 if let Some(row) = self.tables[7].rows.get_mut(&id) {
                     if let Data::Item(item) = &mut row.data {
-                        item.text = None;
+                        item.payload = None;
                     }
                 }
             }
-            // Hash lookups only. A row lookup for every selected id was most of
-            // the incremental poll. Newly selected rows are the ones not yet in
+            // Hash lookups only. Newly selected rows are the ones not yet in
             // text_held. Refreshed owners are re-read from that owner's id set,
-            // because a payload change can leave the keys unchanged.
+            // because a payload change (including startedAt/tool/exitCode) can
+            // leave inline columns unchanged.
             let mut need = Vec::new();
             for id in &selected {
                 if !self.text_held.contains(id) && self.tables[7].rows.contains_key(id) {
@@ -3574,28 +3385,30 @@ mod cache {
             let mut rows_back = 0usize;
             let mut force_next = forced;
             for chunk in need.chunks(800) {
-                let found = load_item_text(db, path, chunk)?;
+                let found = poll1::load_item_payload(db, path, chunk, self.lean)?;
                 rows_back += found.len();
-                for text in found {
-                    seen.insert(text.rowid);
-                    let rowid = text.rowid;
+                for read in found {
+                    seen.insert(read.rowid);
+                    let rowid = read.rowid;
                     let drifted = match self.tables[7].rows.get_mut(&rowid) {
                         Some(row) => match &mut row.data {
                             Data::Item(item) => {
-                                if force_next || !item.matches_text(&row.owner, &text) {
-                                    item.text = None;
+                                if force_next || !item.matches_inline(&row.owner, &read) {
+                                    item.payload = None;
                                     true
                                 } else {
-                                    // A payload-only edit keeps the keys. The agent
+                                    // A payload-only edit keeps the inline keys. The agent
                                     // that shows this row still has to be repainted.
-                                    let fresh = Text {
-                                        body: text.body,
-                                        steps: text.steps,
+                                    let fresh = ItemPayload {
+                                        started_at: read.started_at,
+                                        tool: read.tool.as_deref().map(|t| self.pool.intern(t)),
+                                        exit_code: read.exit_code,
+                                        text: read.text,
                                     };
-                                    if item.text.as_deref() != Some(&fresh) {
+                                    if item.payload.as_deref() != Some(&fresh) {
                                         self.changes.items.insert(rowid);
                                     }
-                                    item.text = Some(Box::new(fresh));
+                                    item.payload = Some(Box::new(fresh));
                                     false
                                 }
                             }
@@ -3618,7 +3431,7 @@ mod cache {
                     }
                     if let Some(row) = self.tables[7].rows.get_mut(id) {
                         if let Data::Item(item) = &mut row.data {
-                            item.text = None;
+                            item.payload = None;
                         }
                     }
                     self.text_held.remove(id);
@@ -3632,6 +3445,28 @@ mod cache {
         }
         pub(super) fn pool_mut(&mut self) -> &mut Pool {
             &mut self.pool
+        }
+        pub(super) fn read_pending(
+            &mut self,
+            db: &Connection,
+            path: &Path,
+            owners: Option<&BTreeSet<String>>,
+            now: f64,
+            inline_ok: bool,
+        ) -> Result<Pending, SourceError> {
+            let idx_and_items = owners
+                .is_some()
+                .then_some((&self.idx, &self.tables[7].rows));
+            Pending::read_scoped(
+                db,
+                path,
+                owners,
+                &mut self.pool,
+                self.lean,
+                inline_ok,
+                Some(now),
+                idx_and_items,
+            )
         }
         pub(super) fn restore(&mut self, undo: Undo) {
             if undo.replaced {
@@ -3999,7 +3834,11 @@ mod cache {
         fn latest_turn(&self, pid: &str) -> Result<Option<Value>, FallbackReason> {
             match self.provider_turns(pid)?.first() {
                 Some(row) => match &row.data {
-                    Data::Turn(v) => Ok(Some(v.parsed().map_err(|_| FallbackReason::AssemblyError)?)),
+                    Data::Turn(v) => Ok(Some(if self.lean {
+                        v.lean_json()?
+                    } else {
+                        v.parsed().map_err(|_| FallbackReason::AssemblyError)?
+                    })),
                     _ => Ok(None),
                 },
                 None => Ok(None),
@@ -4152,9 +3991,13 @@ mod cache {
             let threads = built.len();
             let mut shells = Vec::with_capacity(stubs.len());
             let mut changed = BTreeSet::new();
-            for (index, stub) in stubs.into_iter().enumerate() {
+            for (index, mut stub) in stubs.into_iter().enumerate() {
                 let prior = old.get(stub.id.as_str()).copied();
                 if index >= threads {
+                    if self.lean {
+                        stub.turn = Value::Null;
+                        stub.options.clear();
+                    }
                     // A subagent agent or a remote placeholder, built whole.
                     match prior {
                         Some(prior) if **prior == stub => shells.push(Arc::clone(prior)),
@@ -4227,7 +4070,7 @@ mod cache {
             }
             let mut latest = HashMap::new();
             latest.insert(thread_id.to_owned(), run);
-            source::thread_agent(
+            let mut shell = source::thread_agent(
                 &thread,
                 latest.get(thread_id).unwrap(),
                 &providers,
@@ -4235,7 +4078,12 @@ mod cache {
                 &projects,
                 path,
             )
-            .map_err(|_| FallbackReason::AssemblyError)
+            .map_err(|_| FallbackReason::AssemblyError)?;
+            if self.lean {
+                shell.turn = Value::Null;
+                shell.options.clear();
+            }
+            Ok(shell)
         }
         fn attach_run_spans(
             &self,
@@ -4321,38 +4169,125 @@ mod cache {
                     source::attach_request(&mut agent, kind, created.as_deref(), *async_input);
                 }
             }
+            if self.lean {
+                // The parts of `source::attach_item`, `finish_agent_body` and the event loop
+                // below that `status_view` keeps: the newest update, the current item, the
+                // failure count and the events. Label, command and file are never read here.
+                let agent_run_id = agent.run.get("id").and_then(Value::as_str);
+                let mut matched: Vec<(&Item, &Row)> = Vec::new();
+                for id in items.into_iter().flatten() {
+                    let Some(row) = self.tables[7].rows.get(id) else { continue };
+                    let Data::Item(v) = &row.data else { continue };
+                    if v.run_id.as_deref() == agent_run_id {
+                        matched.push((&**v, row));
+                    }
+                }
+                matched.sort_by(|(a, _), (b, _)| b.updated_at.cmp(&a.updated_at));
+                if let Some((first, _)) = matched.first() {
+                    let updated = first.updated_at.text_owned();
+                    if updated.as_str() > agent.updated.as_deref().unwrap_or("") {
+                        agent.updated = Some(updated);
+                    }
+                }
+                if !agent.requests.is_empty() && crate::model::live(&agent) {
+                    agent.status = "waiting".into();
+                }
+                if agent
+                    .parent
+                    .as_ref()
+                    .is_none_or(|parent| parent == &agent.id || !known.contains(parent))
+                {
+                    agent.parent = None;
+                }
+                let current = |v: &Item| {
+                    source::live_status(&v.status)
+                        && !matches!(v.kind.as_ref(), "secret_request" | "link_request")
+                        && !(agent.open_asks.nonblocking > 0 && v.kind.as_ref() == "user_input_request")
+                };
+                let chosen = matched
+                    .iter()
+                    .find(|(v, _)| current(v) && !matches!(v.kind.as_ref(), "reasoning" | "assistant_message"))
+                    .or_else(|| matched.iter().find(|(v, _)| current(v)))
+                    .copied();
+                agent.now = match chosen {
+                    Some((v, row)) => Some(v.bare(&row.owner)?),
+                    None => None,
+                };
+                for (v, _) in &matched {
+                    if !matches!(v.kind.as_ref(), "reasoning" | "assistant_message")
+                        && v.status.as_ref() == "failed"
+                    {
+                        agent.failures += 1;
+                    }
+                }
+                for id in events.into_iter().flatten() {
+                    let Some(row) = self.tables[7].rows.get(id) else { continue };
+                    let Data::Item(v) = &row.data else { continue };
+                    let payload = v.payload.as_ref().ok_or(FallbackReason::TextDrift)?;
+                    let failed = v.status.as_ref() == "failed";
+                    let time = if failed {
+                        v.updated_at.millis()
+                    } else {
+                        payload
+                            .started_at
+                            .as_ref()
+                            .and_then(Stamp::millis)
+                            .or_else(|| v.updated_at.millis())
+                    };
+                    if let Some(time) = time {
+                        source::attach_event(
+                            &mut agent,
+                            time,
+                            v.kind.as_ref(),
+                            payload.tool.as_deref(),
+                            failed,
+                            None,
+                        );
+                    }
+                }
+                agent.events.sort_by(|p, q| p.t.total_cmp(&q.t));
+                status_view(&mut agent);
+                return Ok(agent);
+            }
             for id in items.into_iter().flatten() {
                 let Some(row) = self.tables[7].rows.get(id) else { continue };
                 let Data::Item(v) = &row.data else { continue };
-                let item = if self.lean { v.bare(&row.owner) } else { v.materialize(&row.owner)? };
+                let item = v.materialize(&row.owner)?;
                 source::attach_item(&mut agent, &item);
             }
             source::finish_agent_body(&mut agent, known);
             for id in events.into_iter().flatten() {
                 let Some(row) = self.tables[7].rows.get(id) else { continue };
                 let Data::Item(v) = &row.data else { continue };
+                let payload = v.payload.as_ref().ok_or(FallbackReason::TextDrift)?;
                 let failed = v.status.as_ref() == "failed";
-                let updated = v.updated_at.text_owned();
-                let started = v.started_at.as_ref().map(Stamp::text_owned);
-                let time = crate::model::ms(if failed { Some(updated.as_str()) } else { started.as_deref() })
-                    .or_else(|| crate::model::ms(Some(updated.as_str())));
-                let painted = if failed && !self.lean { Some(v.materialize(&row.owner)?) } else { None };
+                let time = if failed {
+                    v.updated_at.millis()
+                } else {
+                    payload
+                        .started_at
+                        .as_ref()
+                        .and_then(Stamp::millis)
+                        .or_else(|| v.updated_at.millis())
+                };
+                let painted = if failed { Some(v.materialize(&row.owner)?) } else { None };
                 if let Some(time) = time {
-                    source::attach_event(&mut agent, time, v.kind.as_ref(), v.tool.as_deref(), failed, painted.as_ref());
+                    source::attach_event(
+                        &mut agent,
+                        time,
+                        v.kind.as_ref(),
+                        payload.tool.as_deref(),
+                        failed,
+                        painted.as_ref(),
+                    );
                 }
-            }
-            if self.lean {
-                // History, spans and the plan are not in `status_view`.
-                source::finish_agent_tail(&mut agent);
-                status_view(&mut agent);
-                return Ok(agent);
             }
             self.attach_history(&mut agent, routes)?;
             self.attach_run_spans(&mut agent, since, span_order)?;
             source::finish_agent_tail(&mut agent);
             for id in plans.into_iter().flatten() {
                 let Some(Data::Item(v)) = self.tables[7].rows.get(id).map(|row| &row.data) else { continue };
-                let Some(text) = &v.text else {
+                let Some(text) = v.payload.as_ref().and_then(|p| p.text.as_ref()) else {
                     return Err(FallbackReason::TextDrift);
                 };
                 source::consider_plan(&mut agent, v.run_id.as_deref(), text.steps.as_deref());
@@ -4616,7 +4551,11 @@ mod cache {
             let capping = source::timing::phase("shell_caps");
             let item_ids = self.idx.prefix(3000, false);
             let event_ids = self.idx.prefix(8000, true);
-            let plan_ids: Vec<i64> = self.idx.plans.values().copied().collect();
+            let plan_ids: Vec<i64> = if self.lean {
+                Vec::new()
+            } else {
+                self.idx.plans.values().copied().collect()
+            };
             let new_items: HashSet<i64> = item_ids.iter().copied().collect();
             let new_events: HashSet<i64> = event_ids.iter().copied().collect();
             let new_plans: HashSet<i64> = plan_ids.iter().copied().collect();
@@ -5013,20 +4952,25 @@ mod cache {
                         note("status", arc_bag(&value.status));
                         note("updated_at", stamp_bag(&value.updated_at));
                         let mut started = Bag::default();
-                        started.opt_stamp(&value.started_at);
-                        note("started_at", started);
-                        note("tool", opt_arc_bag(&value.tool));
-                        if let Some(text) = &value.text {
-                            note("label", arc_bag(&text.body.label));
-                            note("command", arc_bag(&text.body.command));
-                            note("file", arc_bag(&text.body.file));
-                            let mut bag = Bag::default();
-                            bag.opt_arc(&text.steps);
-                            note("steps", bag);
+                        let mut tool_bag = Bag::default();
+                        if let Some(payload) = &value.payload {
+                            started.opt_stamp(&payload.started_at);
+                            tool_bag.opt_arc(&payload.tool);
+                            if let Some(text) = &payload.text {
+                                note("label", arc_bag(&text.body.label));
+                                note("command", arc_bag(&text.body.command));
+                                note("file", arc_bag(&text.body.file));
+                                let mut bag = Bag::default();
+                                bag.opt_arc(&text.steps);
+                                note("steps", bag);
+                            }
                         }
+                        note("started_at", started);
+                        note("tool", tool_bag);
                         let bytes = value
-                            .text
+                            .payload
                             .as_ref()
+                            .and_then(|p| p.text.as_ref())
                             .map(|text| {
                                 text.body.label.len()
                                     + text.body.command.len()
@@ -5399,7 +5343,7 @@ mod cache {
         ledger.mark("changes, text_held, projects");
         for row in tables[7].rows.values_mut() {
             if let Data::Item(item) = &mut row.data {
-                item.text = None;
+                item.payload = None;
             }
         }
         ledger.mark("turn_items: selected text (label, command, file, steps)");
@@ -5409,7 +5353,7 @@ mod cache {
             if index == 4 {
                 for row in table.rows.values_mut() {
                     if let Data::Turn(turn) = &mut row.data {
-                        turn.json = blank();
+                        turn.json = empty_json();
                     }
                 }
                 ledger.mark("provider_turns: projected JSON text");
@@ -5460,7 +5404,7 @@ mod cache {
                 panic!("item row")
             };
             assert_eq!(item.status.as_ref(), "completed");
-            assert!(item.text.is_none());
+            assert!(item.payload.is_none());
             cache.reindex(1_794_484_800_000.);
             cache
                 .sync_text(&db.db, &db.path, &BTreeSet::new())
@@ -5468,7 +5412,13 @@ mod cache {
             let Data::Item(item) = &cache.tables[7].rows[&id].data else {
                 panic!("item row")
             };
-            assert_eq!(item.text.as_ref().map(|text| text.body.command.as_ref()), Some("synthetic"));
+            assert_eq!(
+                item.payload
+                    .as_ref()
+                    .and_then(|p| p.text.as_ref())
+                    .map(|text| text.body.command.as_ref()),
+                Some("synthetic")
+            );
         }
 
         #[test]
@@ -5535,6 +5485,8 @@ pub struct Reader {
     plan_plans: BTreeMap<(i64, usize), Option<cache::PlanOrder>>,
     item_plans: BTreeMap<(i64, usize, usize), Option<cache::ItemOrder>>,
     span_plans: BTreeMap<(i64, usize), Option<cache::EncounterOrder>>,
+    thread_scan_plan: Option<(i64, bool)>,
+    item_inline_plan: Option<(i64, bool)>,
     /// Publish `status_view` of every agent and read no item text.
     status_only: bool,
     /// For tests: run once in the next poll, between its probe and its read.
@@ -5569,6 +5521,8 @@ impl Reader {
             plan_plans: BTreeMap::new(),
             item_plans: BTreeMap::new(),
             span_plans: BTreeMap::new(),
+            thread_scan_plan: None,
+            item_inline_plan: None,
             status_only: false,
             between_probe_and_read: None,
         })
@@ -5662,6 +5616,8 @@ impl Reader {
             self.plan_plans.clear();
             self.item_plans.clear();
             self.span_plans.clear();
+            self.thread_scan_plan = None;
+            self.item_inline_plan = None;
             if current != identity(&self.path)? {
                 return Err(error(&self.path, "database replaced while reopening"));
             }
@@ -5690,7 +5646,7 @@ impl Reader {
         }
         self.db
             .execute_batch("BEGIN")
-            .map_err(|e| error(&self.path, e))?;
+            .map_err(|e| sql_error(&self.path, e))?;
         let result = (|| {
             // Pin a single SQLite read snapshot, also for the canary. Otherwise a
             // writer between two oracle calls could produce a false mismatch.
@@ -5749,24 +5705,41 @@ impl Reader {
                 && self.cache.as_ref().is_some_and(|c| !c.blocks_clock(now));
             // Stage all cache changes until transaction teardown and file checks
             // succeed. A failed optional cache read leaves the oracle authoritative.
-            let refresh = source::timing::phase("owner_reread");
-            let pending = if skip || clock_only {
+            let owners = if skip || clock_only {
                 None
             } else {
-                let owners = feed
-                    .as_ref()
-                    .filter(|f| f.complete && self.cache.as_ref().is_some_and(|c| c.index_ready()))
-                    .map(|f| &f.threads);
+                Some(
+                    feed.as_ref()
+                        .filter(|f| f.complete && self.cache.as_ref().is_some_and(|c| c.index_ready()))
+                        .map(|f| &f.threads),
+                )
+            };
+            let item_inline_ok = if skip || clock_only {
+                false
+            } else {
+                match self.item_inline_plan {
+                    Some((schema, ok)) if schema == pinned_schema => ok,
+                    _ => {
+                        let ok = poll1::item_inline_query_ok(&self.db);
+                        self.item_inline_plan = Some((pinned_schema, ok));
+                        ok
+                    }
+                }
+            };
+            let refresh = source::timing::phase("owner_reread");
+            let pending = if let Some(owners) = owners {
                 let created = self.cache.is_none();
                 let lean = self.status_only;
                 let read = {
                     let cache = self.cache.get_or_insert_with(|| cache::Cache::new(lean));
-                    cache::Pending::read(&self.db, &self.path, owners, cache.pool_mut()).ok()
+                    cache.read_pending(&self.db, &self.path, owners, now, item_inline_ok).ok()
                 };
                 if read.is_none() && created {
                     self.cache = None;
                 }
                 read
+            } else {
+                None
             };
             let cache_kept = clock_only || pending.is_some();
             if let Some(cached) = &pending {
@@ -5783,7 +5756,7 @@ impl Reader {
                 let full = pending.full;
                 let lean = self.status_only;
                 let cache = self.cache.get_or_insert_with(|| cache::Cache::new(lean));
-                let staged = cache.stage(&self.db, pending, now);
+                let staged = cache.stage(&self.db, pending, now, item_inline_ok);
                 counters.cache_rows_read += staged.read;
                 undo = Some(staged);
                 if full {
@@ -5797,9 +5770,33 @@ impl Reader {
             drop(staging);
             let mut report = source::ReadReport::default();
             let plan_check = source::timing::phase("thread_plan");
-            let thread_scan = !skip && self.db.prepare(&format!("EXPLAIN QUERY PLAN SELECT {} AS payload FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL AND archived_at IS NULL", source::projection("threads"))).and_then(|mut stmt| {
-                stmt.query_map([], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()
-            }).is_ok_and(|p| p == ["SCAN orchestration_v2_projection_threads"]);
+            let thread_scan = if skip {
+                false
+            } else {
+                match self.thread_scan_plan {
+                    Some((schema, ok))
+                        if schema == pinned_schema
+                            && self.cache.as_ref().is_some_and(|c| c.index_ready()) =>
+                    {
+                        ok
+                    }
+                    _ => {
+                        let ok = self
+                            .db
+                            .prepare(&format!(
+                                "EXPLAIN QUERY PLAN SELECT {} AS payload FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL AND archived_at IS NULL",
+                                source::projection("threads")
+                            ))
+                            .and_then(|mut stmt| {
+                                stmt.query_map([], |r| r.get::<_, String>(3))?
+                                    .collect::<rusqlite::Result<Vec<_>>>()
+                            })
+                            .is_ok_and(|p| p == ["SCAN orchestration_v2_projection_threads"]);
+                        self.thread_scan_plan = Some((pinned_schema, ok));
+                        ok
+                    }
+                }
+            };
             drop(plan_check);
             let invalidation = if skip {
                 None
@@ -5817,49 +5814,53 @@ impl Reader {
             } else {
                 None
             };
-            let orders = |reader: &mut Self, count: usize, runs: usize, runless: usize| {
-                let plans_phase = source::timing::phase("encounter_plans");
-                reader.sub_plans.retain(|(schema, _), _| *schema == pinned_schema);
-                let order = reader
-                    .sub_plans
-                    .entry((pinned_schema, count))
-                    .or_insert_with(|| cache::subagent_order(&reader.db, count))
-                    .clone();
-                reader.request_plans.retain(|(schema, _), _| *schema == pinned_schema);
-                let request_order = reader
-                    .request_plans
-                    .entry((pinned_schema, count))
-                    .or_insert_with(|| cache::request_order(&reader.db, count))
-                    .clone();
-                reader.event_plans.retain(|(schema, _), _| *schema == pinned_schema);
-                let event_order = reader
-                    .event_plans
-                    .entry((pinned_schema, count))
-                    .or_insert_with(|| cache::event_order(&reader.db, count))
-                    .clone();
-                reader.plan_plans.retain(|(schema, _), _| *schema == pinned_schema);
-                let plan_order = reader
-                    .plan_plans
-                    .entry((pinned_schema, runs))
-                    .or_insert_with(|| cache::plan_order(&reader.db, runs))
-                    .clone();
-                reader
-                    .item_plans
-                    .retain(|(schema, _, _), _| *schema == pinned_schema);
-                let item_order = reader
-                    .item_plans
-                    .entry((pinned_schema, runs, runless))
-                    .or_insert_with(|| cache::item_order(&reader.db, runs, runless))
-                    .clone();
-                reader.span_plans.retain(|(schema, _), _| *schema == pinned_schema);
-                let span_order = reader
-                    .span_plans
-                    .entry((pinned_schema, count))
-                    .or_insert_with(|| cache::span_order(&reader.db, count))
-                    .clone();
-                drop(plans_phase);
-                (order, request_order, event_order, plan_order, item_order, span_order)
-            };
+            macro_rules! orders {
+                ($count:expr, $runs:expr, $runless:expr) => {{
+                    let count = $count;
+                    let runs = $runs;
+                    let runless = $runless;
+                    let plans_phase = source::timing::phase("encounter_plans");
+                    self.sub_plans.retain(|(schema, _), _| *schema == pinned_schema);
+                    let order = self
+                        .sub_plans
+                        .entry((pinned_schema, count))
+                        .or_insert_with(|| cache::subagent_order(&self.db, count))
+                        .clone();
+                    self.request_plans.retain(|(schema, _), _| *schema == pinned_schema);
+                    let request_order = self
+                        .request_plans
+                        .entry((pinned_schema, count))
+                        .or_insert_with(|| cache::request_order(&self.db, count))
+                        .clone();
+                    self.event_plans.retain(|(schema, _), _| *schema == pinned_schema);
+                    let event_order = self
+                        .event_plans
+                        .entry((pinned_schema, count))
+                        .or_insert_with(|| cache::event_order(&self.db, count))
+                        .clone();
+                    self.plan_plans.retain(|(schema, _), _| *schema == pinned_schema);
+                    let plan_order = self
+                        .plan_plans
+                        .entry((pinned_schema, runs))
+                        .or_insert_with(|| cache::plan_order(&self.db, runs))
+                        .clone();
+                    self.item_plans
+                        .retain(|(schema, _, _), _| *schema == pinned_schema);
+                    let item_order = self
+                        .item_plans
+                        .entry((pinned_schema, runs, runless))
+                        .or_insert_with(|| cache::item_order(&self.db, runs, runless))
+                        .clone();
+                    self.span_plans.retain(|(schema, _), _| *schema == pinned_schema);
+                    let span_order = self
+                        .span_plans
+                        .entry((pinned_schema, count))
+                        .or_insert_with(|| cache::span_order(&self.db, count))
+                        .clone();
+                    drop(plans_phase);
+                    (order, request_order, event_order, plan_order, item_order, span_order)
+                }};
+            }
             let changed_owners = if clock_only {
                 BTreeSet::new()
             } else {
@@ -5889,31 +5890,81 @@ impl Reader {
             }
             drop(text_phase);
             let mut rebuilt = None;
-            let assembled = if text_fault {
-                None
-            } else if skip || invalidation.is_some() {
-                if let Some(reason) = invalidation {
-                    counters.fallback_reason = Some(reason);
-                }
-                None
+            let mut incremental = false;
+            let full_cache_reason = if invalidation.is_some() {
+                invalidation
             } else if !counters.feed_complete && !clock_only {
-                counters.fallback_reason = Some(if uncommitted {
+                Some(if uncommitted {
                     FallbackReason::WindowExpired
                 } else {
                     counters
                         .fallback_reason
                         .unwrap_or(FallbackReason::FeedUnavailable)
-                });
+                })
+            } else {
+                None
+            };
+            let assembled = if skip {
+                None
+            } else if let Some(reason) = full_cache_reason {
+                // The rows were just read in full, in this transaction, into a new cache.
+                // Assemble from them, as an incremental poll does, in place of a second read
+                // of the same tables. It still counts as a full read (`Served::Full`), and
+                // anything the cache refuses is read as the reference reads it.
+                if !text_fault {
+                    counters.fallback_reason = Some(reason);
+                }
+                if !text_fault
+                    && cache_kept
+                    && thread_scan
+                    && self.cache.as_ref().is_some_and(|c| c.index_ready())
+                {
+                    let count = self.cache.as_ref().unwrap().active_count();
+                    let runs = self.cache.as_ref().unwrap().run_ref_count();
+                    let runless = self.cache.as_ref().unwrap().runless_count();
+                    let (order, request_order, event_order, plan_order, item_order, span_order) =
+                        orders!(count, runs, runless);
+                    self.cache.as_mut().unwrap().mark_inputs_stale();
+                    match self.cache.as_mut().unwrap().assemble_fast(
+                        &self.path,
+                        now,
+                        None,
+                        order,
+                        request_order,
+                        event_order,
+                        plan_order,
+                        item_order,
+                        span_order,
+                        &BTreeSet::new(),
+                        &mut report,
+                    ) {
+                        Ok(out) => {
+                            report.threads = self.cache.as_ref().unwrap().active_count();
+                            rebuilt = Some(out.rebuilt);
+                            Some(out.snapshot)
+                        }
+                        Err(_) => {
+                            self.cache.as_mut().unwrap().mark_inputs_stale();
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else if text_fault {
                 None
             } else if !thread_scan {
                 counters.fallback_reason = Some(FallbackReason::ThreadScanPlan);
+                None
+            } else if !cache_kept {
+                counters.fallback_reason = Some(FallbackReason::CacheUnavailable);
                 None
             } else if self.cache.is_some() {
                 let count = self.cache.as_ref().unwrap().active_count();
                 let runs = self.cache.as_ref().unwrap().run_ref_count();
                 let runless = self.cache.as_ref().unwrap().runless_count();
                 let (order, request_order, event_order, plan_order, item_order, span_order) =
-                    orders(self, count, runs, runless);
+                    orders!(count, runs, runless);
                 let fast = self.cache.as_mut().unwrap().assemble_fast(
                     &self.path,
                     now,
@@ -5930,6 +5981,7 @@ impl Reader {
                 match fast {
                     Ok(out) => {
                         rebuilt = Some(out.rebuilt);
+                        incremental = true;
                         counters.fallback_reason = None;
                         Some(out.snapshot)
                     }
@@ -5958,6 +6010,7 @@ impl Reader {
                                 span_order,
                             ) {
                                 Ok(snapshot) => {
+                                    incremental = true;
                                     counters.fallback_reason = None;
                                     Some(snapshot)
                                 }
@@ -5976,7 +6029,6 @@ impl Reader {
                 counters.fallback_reason = Some(FallbackReason::CacheUnavailable);
                 None
             };
-            let incremental = assembled.is_some();
             let mut snapshot = if skip {
                 let mut s = self.previous.as_ref().unwrap().clone();
                 s.at = now;
@@ -5984,15 +6036,30 @@ impl Reader {
             } else {
                 match assembled {
                     Some(mut snapshot) => {
-                        // Thread ask counts depend on rows outside the cached item
-                        // window. The verified suffix covers card, run and message events.
-                        let owners: Vec<_> = changed_owners.iter().cloned().collect();
+                        let asks_phase = source::timing::phase("ask_counts");
                         let mut cards = HashMap::new();
                         let mut estimates = HashMap::new();
-                        for batch in owners.chunks(500) {
+                        if incremental {
+                            // Thread ask counts depend on rows outside the cached item
+                            // window. The verified suffix covers card, run and message events.
+                            let owners: Vec<_> = changed_owners.iter().cloned().collect();
+                            for batch in owners.chunks(500) {
+                                let counts = (|| -> rusqlite::Result<()> {
+                                    cards.extend(source::read_ask_cards(&self.db, Some(batch))?);
+                                    estimates.extend(source::read_estimated_asks(&self.db, Some(batch))?);
+                                    Ok(())
+                                })();
+                                if let Err(e) = counts {
+                                    if let (Some(cache), Some(undo)) = (self.cache.as_mut(), undo.take()) {
+                                        cache.restore(undo);
+                                    }
+                                    return Err(error(&self.path, e));
+                                }
+                            }
+                        } else {
                             let counts = (|| -> rusqlite::Result<()> {
-                                cards.extend(source::read_ask_cards(&self.db, Some(batch))?);
-                                estimates.extend(source::read_estimated_asks(&self.db, Some(batch))?);
+                                cards = source::read_ask_cards(&self.db, None)?;
+                                estimates = source::read_estimated_asks(&self.db, None)?;
                                 Ok(())
                             })();
                             if let Err(e) = counts {
@@ -6007,8 +6074,11 @@ impl Reader {
                             &mut snapshot,
                             &cards,
                             &estimates,
-                            self.previous.as_ref().map(|previous| (previous, &changed_owners)),
+                            incremental
+                                .then(|| self.previous.as_ref().map(|previous| (previous, &changed_owners)))
+                                .flatten(),
                         );
+                        drop(asks_phase);
                         snapshot
                     }
                     None => match source::read_tracked(&self.db, &self.path, now, &mut report) {
@@ -6042,7 +6112,7 @@ impl Reader {
                 let runs = self.cache.as_ref().unwrap().run_ref_count();
                 let runless = self.cache.as_ref().unwrap().runless_count();
                 let (order, request_order, event_order, plan_order, item_order, span_order) =
-                    orders(self, count, runs, runless);
+                    orders!(count, runs, runless);
                 let sealing = source::timing::phase("seal");
                 let _ = self.cache.as_mut().unwrap().seal(
                     &self.path,
@@ -6103,7 +6173,7 @@ impl Reader {
         let rollback = self
             .db
             .execute_batch("ROLLBACK")
-            .map_err(|e| error(&self.path, e));
+            .map_err(|e| sql_error(&self.path, e));
         let (snapshot, changed, deadline, mismatch, feed, undo, incremental, cache_kept, cache_full) =
             match result {
                 Ok(v) => {
@@ -6238,6 +6308,18 @@ impl Handle {
     pub fn take(&self) -> Option<Result<Update, SourceError>> {
         self.latest.lock().unwrap().take()
     }
+    /// A mailbox with no reader thread behind it, for the presenter's deterministic stream
+    /// check: the check polls its own [`Reader`] at a scripted clock and posts the result with
+    /// [`Handle::offer`], so the host takes it exactly as it takes the worker's.
+    #[cfg(feature = "frame-stream")]
+    pub fn detached() -> Self {
+        Self { latest: Arc::new(Mutex::new(None)), stop: None }
+    }
+    /// Put a finished poll in the mailbox, replacing one not yet taken, as the worker does.
+    #[cfg(feature = "frame-stream")]
+    pub fn offer(&self, result: Result<Update, SourceError>) {
+        *self.latest.lock().unwrap() = Some(result);
+    }
 }
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -6249,12 +6331,35 @@ pub fn spawn(
     interval: Duration,
     wake: impl Fn() + Send + 'static,
 ) -> Handle {
+    spawn_inner(path, None, interval, wake)
+}
+pub fn spawn_with_reader(
+    path: impl AsRef<Path>,
+    reader: Reader,
+    interval: Duration,
+    wake: impl Fn() + Send + 'static,
+) -> Handle {
+    spawn_inner(path, Some(reader), interval, wake)
+}
+fn spawn_inner(
+    path: impl AsRef<Path>,
+    initial: Option<Reader>,
+    interval: Duration,
+    wake: impl Fn() + Send + 'static,
+) -> Handle {
     let path = path.as_ref().to_owned();
     let latest = Arc::new(Mutex::new(None));
     let mailbox = latest.clone();
     let (stop, stopped) = mpsc::channel();
+    let has_initial = initial.is_some();
     thread::spawn(move || {
-        let mut reader = None;
+        let mut reader = initial;
+        if has_initial
+            && stopped.recv_timeout(interval.max(Duration::from_millis(1)))
+                != Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            return;
+        }
         loop {
             if stopped.try_recv() != Err(mpsc::TryRecvError::Empty) {
                 break;
@@ -6755,5 +6860,203 @@ mod privacy_tests {
                 .prepare("SELECT default_provider FROM orchestration_v2_projection_threads")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn moved_run_from_archived_thread_recovers_with_zero_mismatches() {
+        let mut db = support::Db::new();
+        db.write("arch", 0);
+        db.write("dest", 1);
+        db.db
+            .execute_batch(
+                r#"
+                UPDATE orchestration_v2_projection_threads
+                   SET archived_at='2026-11-12T10:00:00.000Z'
+                 WHERE thread_id='arch';
+                INSERT INTO orchestration_v2_projection_runs
+                    (run_id,thread_id,ordinal,provider,status,requested_at,payload_json)
+                VALUES
+                    ('r_move','arch',1,'codex','running','2026-11-12T11:00:00.000Z',
+                     '{"id":"r_move","threadId":"arch","status":"running","startedAt":"2026-11-12T11:00:00.000Z"}');
+                INSERT INTO orchestration_v2_projection_turn_items
+                    (turn_item_id,thread_id,run_id,ordinal,type,status,updated_at,payload_json)
+                VALUES
+                    ('ti_move','dest','r_move',1,'command_execution','running','2026-11-12T11:30:00.000Z',
+                     '{"input":"cargo test"}');
+                "#,
+            )
+            .unwrap();
+        let now = 1_794_484_800_000.;
+        let mut reader = Reader::open(&db.path).unwrap().with_self_check(true);
+        let mut lean_reader = Reader::open(&db.path).unwrap().status_only().with_self_check(true);
+        let u1 = reader.poll(now).unwrap();
+        assert!(!u1.mismatch);
+        assert_eq!(u1.counters.mismatches, 0);
+        assert_eq!(u1.snapshot.agents.len(), 1);
+        assert_eq!(u1.snapshot.agents[0].id, "dest");
+        assert_eq!(u1.snapshot.agents[0].status, "idle");
+        let l1 = lean_reader.poll(now).unwrap();
+        assert!(!l1.mismatch);
+        assert_eq!(l1.counters.mismatches, 0);
+
+        // Move the run out of the archived thread into `dest`, emitting an event ONLY on `arch`.
+        db.touch(
+            "arch",
+            2,
+            r#"
+            UPDATE orchestration_v2_projection_runs
+               SET thread_id='dest',
+                   payload_json='{"id":"r_move","threadId":"dest","status":"running","startedAt":"2026-11-12T11:00:00.000Z"}'
+             WHERE run_id='r_move';
+            "#,
+        );
+        let u2 = reader.poll(now).unwrap();
+        assert!(!u2.mismatch, "moved run from archived thread caused self-check mismatch");
+        assert_eq!(u2.counters.mismatches, 0);
+        assert_eq!(u2.served, Served::Incremental);
+        let dest = u2.snapshot.agents.iter().find(|a| a.id == "dest").unwrap();
+        assert_eq!(dest.status, "running");
+        let l2 = lean_reader.poll(now).unwrap();
+        assert!(!l2.mismatch, "lean reader moved run caused self-check mismatch");
+        assert_eq!(l2.counters.mismatches, 0);
+        assert_eq!(l2.served, Served::Incremental);
+    }
+
+    /// The status reader's own statements (the inline turn-item columns, by owner and by run,
+    /// and the keys read by rowid) are held to the same column allowlist as the full reader's.
+    #[test]
+    fn status_only_reads_stay_inside_the_column_allowlist() {
+        let mut db = support::Db::new();
+        db.write("a", 0);
+        db.write("b", 1);
+        let now = 1_794_484_800_000.;
+        let mut reader = Reader::open(&db.path).unwrap().status_only().with_self_check(true);
+        // SAFETY: callback captures no state; handle remains alive throughout.
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_set_authorizer(
+                    reader.db.handle(),
+                    Some(allow),
+                    std::ptr::null_mut()
+                ),
+                rusqlite::ffi::SQLITE_OK
+            );
+        }
+        // The authorizer rules at prepare time, so preparing a statement is the whole check.
+        for sql in [
+            poll1::item_keys_query(1),
+            poll1::item_keys_query(3),
+            poll1::run_inline_query(),
+            cache::owner_query(7, &poll1::item_inline_query()),
+        ] {
+            reader.db.prepare(&sql).unwrap();
+        }
+        let first = reader.poll(now).unwrap();
+        assert!(!first.mismatch);
+        assert!(first.counters.cache_ready && first.counters.cache_full);
+        db.write("a", 2);
+        let next = reader.poll(now).unwrap();
+        assert!(!next.mismatch);
+        assert_eq!(next.served, Served::Incremental, "{:?}", next.counters.fallback_reason);
+    }
+
+    /// The launch read's reader goes to the worker, cache and all. The worker's first poll,
+    /// one interval later, is then a skipped or an incremental one. A reader it had to open
+    /// itself would read everything again.
+    #[test]
+    fn a_handed_over_reader_is_not_read_in_full_again() {
+        let mut db = support::Db::new();
+        db.write("a", 0);
+        db.write("b", 1);
+        let mut reader = Reader::open(&db.path).unwrap();
+        let first = reader.poll(crate::clock::wall_now()).unwrap();
+        assert_eq!(first.served, Served::Full);
+        let (woke, woken) = mpsc::channel();
+        let handle = spawn_with_reader(&db.path, reader, Duration::from_millis(20), move || {
+            let _ = woke.send(());
+        });
+        woken
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the worker polls one interval after the handoff");
+        let update = handle.take().expect("the worker's poll is in the mailbox").unwrap();
+        assert_ne!(update.served, Served::Full, "{:?}", update.counters.fallback_reason);
+        assert_eq!(update.snapshot.agents.len(), first.snapshot.agents.len());
+        assert_eq!(
+            serde_json::to_value(&update.snapshot.agents).unwrap(),
+            serde_json::to_value(&first.snapshot.agents).unwrap()
+        );
+    }
+
+    #[test]
+    fn live_error_and_sql_error_match_source_snapshot_parity() {
+        let db = support::Db::new();
+        let dir = db.path.parent().unwrap();
+        let now = 1_794_484_800_000.;
+
+        // 1) Missing path -> kind: "missing", detail: ""
+        let missing = dir.join("does-not-exist.sqlite");
+        let src_err = source::snapshot(&missing, now).unwrap_err();
+        let live_err = Reader::open(&missing).err().unwrap();
+        assert_eq!(live_err.kind, "missing");
+        assert_eq!(live_err.detail, "");
+        assert_eq!(live_err.kind, src_err.kind);
+        assert_eq!(live_err.detail, src_err.detail);
+
+        // 2) Directory path -> kind: "unreadable", detail: "it is a folder, not a file"
+        let folder = dir.join("folder.sqlite");
+        std::fs::create_dir(&folder).unwrap();
+        let src_err = source::snapshot(&folder, now).unwrap_err();
+        let live_err = Reader::open(&folder).err().unwrap();
+        assert_eq!(live_err.kind, "unreadable");
+        assert_eq!(live_err.detail, "it is a folder, not a file");
+        assert_eq!(live_err.kind, src_err.kind);
+        assert_eq!(live_err.detail, src_err.detail);
+
+        // 3) Non-SQLite file -> kind: "unreadable", detail: "not a SQLite database"
+        let bogus = dir.join("not-a-db.sqlite");
+        std::fs::write(&bogus, b"this is not a SQLite database\n").unwrap();
+        let src_err = source::snapshot(&bogus, now).unwrap_err();
+        let live_err = Reader::open(&bogus)
+            .and_then(|mut r| r.poll(now).map(|_| ()))
+            .unwrap_err();
+        assert_eq!(live_err.kind, "unreadable");
+        assert_eq!(live_err.detail, "not a SQLite database");
+        assert_eq!(live_err.kind, src_err.kind);
+        assert_eq!(live_err.detail, src_err.detail);
+    }
+
+    #[test]
+    fn descending_thread_index_is_rejected_by_index_xinfo_guard() {
+        let mut db = support::Db::new();
+        db.write("a", 0);
+        db.write("b", 1);
+        db.db
+            .execute_batch(
+                r#"
+                DROP INDEX orchestration_v2_projection_turn_items_thread_run_idx;
+                CREATE INDEX idx_turn_items_thread_desc
+                    ON orchestration_v2_projection_turn_items(thread_id DESC, ordinal ASC);
+                INSERT INTO orchestration_v2_projection_runs
+                    (run_id,thread_id,ordinal,provider,status,requested_at,payload_json)
+                VALUES
+                    ('r1','a',1,'codex','running','2026-11-12T11:00:00.000Z',
+                     '{"id":"r1","threadId":"a","status":"running"}');
+                INSERT INTO orchestration_v2_projection_turn_items
+                    (turn_item_id,thread_id,run_id,ordinal,type,status,updated_at,payload_json)
+                VALUES
+                    ('i1','a','r1',1,'command_execution','completed','2026-11-12T11:50:00.000Z','{"input":"cmd1"}'),
+                    ('i2','a','r1',2,'command_execution','completed','2026-11-12T11:50:00.000Z','{"input":"cmd2"}');
+                "#,
+            )
+            .unwrap();
+        assert!(!poll1::index_first_col_asc_binary(
+            &db.db,
+            "idx_turn_items_thread_desc"
+        ));
+        let now = 1_794_484_800_000.;
+        let mut reader = Reader::open(&db.path).unwrap().with_self_check(true);
+        let u = reader.poll(now).unwrap();
+        assert!(!u.mismatch);
+        assert_eq!(u.counters.mismatches, 0);
     }
 }

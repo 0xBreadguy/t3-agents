@@ -22,7 +22,11 @@ use t3_agents_core::cluster::{
     self, DEFAULT_BG, Glyph, Laid, LaidCell, TermEnv, WidthMethod, explicit_cursor_positioning,
     select_width_method,
 };
-use t3_agents_core::terminal::Canvas;
+use t3_agents_core::terminal::{Canvas, Cell};
+
+/// Past this many distinct multi-character cluster texts, the next frame is laid out afresh, so
+/// the text table a reused buffer carries from frame to frame cannot grow without bound.
+const MAX_KEPT_TEXTS: usize = 4096;
 
 /// Alternate screen, hidden cursor, no autowrap, button-event mouse, SGR encoding, and bracketed
 /// paste (2004, which the original also switches on), so pasted text arrives between markers the
@@ -47,6 +51,15 @@ pub struct Encoder {
     drift: bool,
     /// The terminal's last answer about mode 2027, which the width method follows.
     mode_2027: Option<u8>,
+    /// The canvas `prev` was laid out from, with the width method used, when `prev` came from
+    /// [`Encoder::encode`]. A row equal to the same row here lays out to the same cells, so it
+    /// is neither laid out nor compared again.
+    prev_canvas: Option<(Vec<Cell>, WidthMethod)>,
+    /// Scratch kept between frames: one row of the previous buffer, the spans to write, and the
+    /// run text for the layout.
+    old_row: Vec<LaidCell>,
+    spans: Vec<usize>,
+    text: String,
 }
 
 impl Encoder {
@@ -74,6 +87,10 @@ impl Encoder {
             env,
             drift: false,
             mode_2027: None,
+            prev_canvas: None,
+            old_row: Vec::new(),
+            spans: Vec::new(),
+            text: String::new(),
         }
     }
 
@@ -140,12 +157,91 @@ impl Encoder {
     /// Bytes for this frame. An unchanged diff is empty: no synchronized-output
     /// wrapper and no cursor move. `full` repaints every cell (first frame, resize).
     pub fn encode(&mut self, canvas: &Canvas, full: bool) -> Vec<u8> {
+        let reusable = !full
+            && self.prev.as_ref().is_some_and(|p| {
+                p.w == canvas.w && p.h == canvas.h && p.text_count() <= MAX_KEPT_TEXTS
+            })
+            && self.prev_canvas.as_ref().is_some_and(|(cells, method)| {
+                *method == self.method && cells.len() == canvas.cells.len()
+            });
+        if reusable {
+            return self.encode_rows(canvas);
+        }
         let laid = cluster::lay_out(canvas, self.method);
-        self.encode_laid(laid, full)
+        let bytes = self.encode_laid_inner(laid, full);
+        let mut cells = self.prev_canvas.take().map(|(cells, _)| cells).unwrap_or_default();
+        cells.clear();
+        cells.extend_from_slice(&canvas.cells);
+        self.prev_canvas = Some((cells, self.method));
+        bytes
+    }
+
+    /// [`Encoder::encode`] when the previous frame was laid out from a canvas of this size with
+    /// this width method, and this frame is not a full repaint. The result is byte for byte what
+    /// laying out the whole canvas and diffing it with [`Encoder::encode_laid`] gives:
+    ///
+    /// - A row whose canvas cells equal the previous canvas's lays out to the same cells (a row's
+    ///   layout depends on nothing else), every one of them [`Laid::same`] as before, so it adds
+    ///   no span and leaves the buffer as it was. Only the other rows are laid out again, in
+    ///   place, and compared.
+    /// - Within one buffer two cells hold the same text exactly when they hold the same cluster
+    ///   id (`intern` gives one id per text), so comparing a re-laid row with its old cells by
+    ///   value is [`Laid::same`].
+    /// - Spans are collected in index order, as the full diff collects them, and written with the
+    ///   same `place`, so the encoder's cursor and style state moves through the same steps.
+    /// - When nothing differs the frame is empty and the buffer that stays equals the old one
+    ///   cell for cell, which is all a later diff reads.
+    fn encode_rows(&mut self, canvas: &Canvas) -> Vec<u8> {
+        let mut laid = self.prev.take().expect("checked by encode");
+        let (mut prev_cells, method) = self.prev_canvas.take().expect("checked by encode");
+        let w = laid.w;
+        let mut spans = std::mem::take(&mut self.spans);
+        spans.clear();
+        let mut changed = false;
+        for y in 0..laid.h {
+            let row = y * w..(y + 1) * w;
+            if canvas.cells[row.clone()] == prev_cells[row.clone()] {
+                continue;
+            }
+            prev_cells[row.clone()].copy_from_slice(&canvas.cells[row.clone()]);
+            self.old_row.clear();
+            self.old_row.extend_from_slice(&laid.cells[row.clone()]);
+            laid.relay_row(canvas, y, method, &mut self.text);
+            for (k, (new, old)) in laid.cells[row.clone()].iter().zip(&self.old_row).enumerate() {
+                if new == old {
+                    continue;
+                }
+                changed = true;
+                if !matches!(new.glyph, Glyph::Cont { .. }) {
+                    spans.push(row.start + k);
+                }
+            }
+        }
+        self.prev_canvas = Some((prev_cells, method));
+        if !changed {
+            self.prev = Some(laid);
+            self.spans = spans;
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(laid.w * laid.h);
+        out.extend_from_slice(b"\x1b[?2026h");
+        for &i in &spans {
+            self.place(&mut out, i % w, i / w, &laid, i, false);
+        }
+        out.extend_from_slice(b"\x1b[?2026l");
+        self.prev = Some(laid);
+        self.spans = spans;
+        out
     }
 
     /// [`Encoder::encode`] for a buffer already laid out.
-    pub fn encode_laid(&mut self, laid: Laid, mut full: bool) -> Vec<u8> {
+    pub fn encode_laid(&mut self, laid: Laid, full: bool) -> Vec<u8> {
+        // The canvas behind this buffer is not known: the next frame lays out every row.
+        self.prev_canvas = None;
+        self.encode_laid_inner(laid, full)
+    }
+
+    fn encode_laid_inner(&mut self, laid: Laid, mut full: bool) -> Vec<u8> {
         let resized = self
             .prev
             .as_ref()
@@ -933,5 +1029,228 @@ mod tests {
     fn fuzz_demo_and_edge_frames() {
         fuzz("../../checks/fixtures/demo.json", 0x51_7a_c0_11);
         fuzz("../../checks/generated/edge.json", 0xa1_7e_d9_03);
+    }
+}
+
+#[cfg(test)]
+mod row_reuse_tests {
+    use super::*;
+    use t3_agents_core::terminal::CONT;
+
+    /// Cells written raw, so the canvas can hold anything a frame can: wide halves, orphaned
+    /// continuations, combining marks, emoji sequences split across cells, and style changes in
+    /// the middle of a cluster.
+    const GLYPHS: &[char] = &[
+        'a', 'b', ' ', '│', '▔', '●', '⠋', '漢', '字', CONT, '\u{301}', '\u{200d}', '👩', '🏽', 'é', '\u{fe0f}', '❤',
+        '\u{7}',
+    ];
+    const COLORS: &[u32] = &[0x10_2030, 0xff_ffff, cluster::DEFAULT_BG, 0x00_0001];
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize
+        }
+    }
+
+    fn scramble(c: &mut Canvas, rng: &mut Rng, cells: usize) {
+        for _ in 0..cells {
+            let i = rng.next() % c.cells.len();
+            let cell = &mut c.cells[i];
+            match rng.next() % 4 {
+                0 => cell.fg = COLORS[rng.next() % COLORS.len()],
+                1 => cell.bg = COLORS[rng.next() % COLORS.len()],
+                2 => cell.bold = !cell.bold,
+                _ => cell.ch = GLYPHS[rng.next() % GLYPHS.len()],
+            }
+        }
+    }
+
+    /// The reference: every frame laid out whole and diffed whole, as before rows were reused.
+    fn reference(enc: &mut Encoder, canvas: &Canvas, full: bool) -> Vec<u8> {
+        enc.encode_laid(cluster::lay_out(canvas, enc.method), full)
+    }
+
+    #[test]
+    fn reused_rows_write_the_same_bytes_as_a_whole_layout() {
+        let configs: [(WidthMethod, bool, bool); 6] = [
+            (WidthMethod::Unicode, false, false),
+            (WidthMethod::Unicode, false, true),
+            (WidthMethod::Wcwidth, false, false),
+            (WidthMethod::UnicodeWide, false, true),
+            (WidthMethod::Unicode, true, false),
+            (WidthMethod::Wcwidth, true, true),
+        ];
+        for (n, (method, explicit, after)) in configs.into_iter().enumerate() {
+            let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ n as u64);
+            let make = || {
+                let mut e = Encoder::new();
+                e.set_width_method(method);
+                e.set_explicit_width(explicit);
+                e.set_cursor_after_cluster(after);
+                e
+            };
+            let (mut fast, mut slow) = (make(), make());
+            let mut size = (23, 7);
+            let mut canvas = Canvas::new(size.0, size.1);
+            scramble(&mut canvas, &mut rng, 200);
+            let mut full = true;
+            for step in 0..400 {
+                if step % 97 == 50 {
+                    size = if size == (23, 7) { (17, 5) } else { (23, 7) };
+                    canvas = Canvas::new(size.0, size.1);
+                    scramble(&mut canvas, &mut rng, 120);
+                }
+                if step % 61 == 30 {
+                    full = true;
+                }
+                // Mostly a few cells, sometimes none (an identical frame), sometimes many.
+                let touched = match rng.next() % 6 {
+                    0 => 0,
+                    1 => 40,
+                    _ => 1 + rng.next() % 4,
+                };
+                scramble(&mut canvas, &mut rng, touched);
+                let a = fast.encode(&canvas, full);
+                let b = reference(&mut slow, &canvas, full);
+                assert_eq!(a, b, "config {n} step {step}");
+                full = false;
+            }
+        }
+    }
+
+    /// Every setter and answer the dashboard can give the encoder
+    /// between frames, in any order and without a repaint, with rows copied over each other and
+    /// shifted (so equal rows meet different neighbours), frames that go through `encode_laid`
+    /// in between (which drops the kept canvas), and canvases down to one cell.
+    #[test]
+    fn reused_rows_survive_any_order_of_changes() {
+        const METHODS: [WidthMethod; 3] = [WidthMethod::Unicode, WidthMethod::Wcwidth, WidthMethod::UnicodeWide];
+        for seed in 0..6u64 {
+            let mut rng = Rng(0xd1b5_4a32_d192_ed03 ^ (seed << 32) ^ seed);
+            let (mut fast, mut slow) = (Encoder::new(), Encoder::new());
+            let mut canvas = Canvas::new(1 + rng.next() % 30, 1 + rng.next() % 9);
+            let cells = canvas.cells.len();
+            scramble(&mut canvas, &mut rng, cells);
+            let mut full = true;
+            for step in 0..6000 {
+                let mut laid_frame = false;
+                match rng.next() % 48 {
+                    0 => {
+                        canvas = Canvas::new(1 + rng.next() % 30, 1 + rng.next() % 9);
+                        let cells = canvas.cells.len();
+                        scramble(&mut canvas, &mut rng, cells / 2 + 1);
+                    }
+                    1 | 2 => {
+                        let method = METHODS[rng.next() % 3];
+                        fast.set_width_method(method);
+                        slow.set_width_method(method);
+                    }
+                    3 => {
+                        let on = rng.next() % 2 == 0;
+                        fast.set_explicit_width(on);
+                        slow.set_explicit_width(on);
+                    }
+                    4 => {
+                        let on = rng.next() % 2 == 0;
+                        fast.set_cursor_after_cluster(on);
+                        slow.set_cursor_after_cluster(on);
+                    }
+                    5 => full = true,
+                    6 => {
+                        let value = (rng.next() % 5) as u8;
+                        assert_eq!(fast.terminal_mode_2027(value), slow.terminal_mode_2027(value));
+                    }
+                    7 => assert_eq!(fast.terminal_truecolor(), slow.terminal_truecolor()),
+                    8 => {
+                        let (index, rgb) = ((rng.next() % 17) as u8, (rng.next() & 0xff_ffff) as u32);
+                        assert_eq!(fast.terminal_palette(index, rgb), slow.terminal_palette(index, rgb));
+                    }
+                    9 => {
+                        let text = ["kitty(0.42.1)", "tmux 3.5a", "ghostty 1.2.0", "nothing 1"][rng.next() % 4];
+                        assert_eq!(fast.terminal_xtversion(text), slow.terminal_xtversion(text));
+                    }
+                    10 | 11 => laid_frame = true,
+                    12..=14 if canvas.h > 1 => {
+                        // One row copied over another: the same cells under a different row.
+                        let (from, to) = (rng.next() % canvas.h, rng.next() % canvas.h);
+                        let w = canvas.w;
+                        canvas.cells.copy_within(from * w..(from + 1) * w, to * w);
+                    }
+                    15..=17 if canvas.w > 1 => {
+                        // A row shifted by one cell, splitting whatever clusters it held.
+                        let (y, w) = (rng.next() % canvas.h, canvas.w);
+                        canvas.cells[y * w..(y + 1) * w].rotate_right(1);
+                    }
+                    _ => {}
+                }
+                let touched = match rng.next() % 6 {
+                    0 => 0,
+                    1 => 25,
+                    _ => 1 + rng.next() % 3,
+                };
+                scramble(&mut canvas, &mut rng, touched);
+                let a = if laid_frame {
+                    fast.encode_laid(cluster::lay_out(&canvas, fast.method), full)
+                } else {
+                    fast.encode(&canvas, full)
+                };
+                let b = reference(&mut slow, &canvas, full);
+                assert_eq!(a, b, "seed {seed} step {step}");
+                full = false;
+            }
+        }
+    }
+
+    /// The kept text table is filled past `MAX_KEPT_TEXTS` with
+    /// distinct multi-character clusters, so the frame after that is laid out afresh, and the
+    /// bytes stay those of a whole layout before, at and after the cap.
+    #[test]
+    fn the_kept_text_cap_is_reached_and_changes_no_byte() {
+        let marks: Vec<char> = ('\u{300}'..='\u{36f}').collect();
+        let bases: Vec<char> = ('a'..='z').chain('A'..='Z').collect();
+        let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+        let (mut fast, mut slow) = (Encoder::new(), Encoder::new());
+        let mut canvas = Canvas::new(40, 6);
+        let (mut most, mut resets, mut last) = (0, 0, 0);
+        let mut full = true;
+        for step in 0..1200 {
+            for _ in 0..12 {
+                // A base letter and a combining mark in neighbouring cells: one two-character
+                // cluster, one more entry in the table unless it was seen before.
+                let i = rng.next() % (canvas.cells.len() - 1);
+                canvas.cells[i].ch = bases[rng.next() % bases.len()];
+                canvas.cells[i + 1].ch = marks[rng.next() % marks.len()];
+                canvas.cells[i + 1].fg = canvas.cells[i].fg;
+                canvas.cells[i + 1].bg = canvas.cells[i].bg;
+                canvas.cells[i + 1].bold = canvas.cells[i].bold;
+            }
+            assert_eq!(fast.encode(&canvas, full), reference(&mut slow, &canvas, full), "step {step}");
+            full = false;
+            let kept = fast.prev.as_ref().unwrap().text_count();
+            most = most.max(kept);
+            resets += usize::from(kept < last);
+            last = kept;
+        }
+        assert!(most > MAX_KEPT_TEXTS, "the table reached {most}");
+        assert!(resets >= 1, "the table was never dropped");
+    }
+
+    #[test]
+    fn a_method_change_without_full_lays_out_every_row() {
+        let mut rng = Rng(7);
+        let mut canvas = Canvas::new(12, 4);
+        scramble(&mut canvas, &mut rng, 60);
+        let (mut fast, mut slow) = (Encoder::new(), Encoder::new());
+        assert_eq!(fast.encode(&canvas, true), reference(&mut slow, &canvas, true));
+        for method in [WidthMethod::Wcwidth, WidthMethod::UnicodeWide, WidthMethod::Unicode] {
+            fast.set_width_method(method);
+            slow.set_width_method(method);
+            scramble(&mut canvas, &mut rng, 2);
+            assert_eq!(fast.encode(&canvas, false), reference(&mut slow, &canvas, false));
+        }
     }
 }

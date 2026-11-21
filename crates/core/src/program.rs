@@ -131,6 +131,35 @@ struct Word {
     incomplete: bool,
 }
 
+// Bytes a word can copy as-is, indexed by quote state and whether expansions count.
+// Outside quotes, shell whitespace, word delimiters, quotes and escapes end a run.
+// Inside single quotes only the closing quote does. Inside double quotes, escapes
+// and the closing quote end a run; expansion markers count except in single quotes.
+const fn plain_table(quote: u8, expansions: bool) -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let byte = index as u8;
+        let expansion = expansions && matches!(byte, b'$' | b'`');
+        table[index] = match quote {
+            0 => !byte.is_ascii_whitespace()
+                && !matches!(byte, b';' | b'&' | b'|' | b'(' | b')' | b'{' | b'}' | b'<' | b'>'
+                    | b'\\' | b'\'' | b'"')
+                && !expansion,
+            b'\'' => byte != b'\'',
+            _ => !matches!(byte, b'\\' | b'"') && !expansion,
+        };
+        index += 1;
+    }
+    table
+}
+
+const PLAIN: [[[bool; 256]; 2]; 3] = [
+    [plain_table(0, false), plain_table(0, true)],
+    [plain_table(b'\'', false), plain_table(b'\'', true)],
+    [plain_table(b'"', false), plain_table(b'"', true)],
+];
+
 struct Lexer<'a> { bytes: &'a [u8], pos: usize }
 impl<'a> Lexer<'a> {
     fn at(&self, s: &[u8]) -> bool { self.bytes[self.pos..].starts_with(s) }
@@ -193,6 +222,21 @@ impl<'a> Lexer<'a> {
         let mut quote = 0;
         while self.pos < self.bytes.len() {
             let c = self.bytes[self.pos];
+            let quote_slot = match quote {
+                0 => 0,
+                b'\'' => 1,
+                _ => 2,
+            };
+            let plain = &PLAIN[quote_slot][usize::from(expansions)];
+            if plain[usize::from(c)] {
+                let from = self.pos;
+                self.pos += 1;
+                while self.pos < self.bytes.len() && plain[usize::from(self.bytes[self.pos])] {
+                    self.pos += 1;
+                }
+                value.extend_from_slice(&self.bytes[from..self.pos]);
+                continue;
+            }
             if expansions && quote != b'\'' && (self.at(b"${") || (quote == 0 && (self.at(b"<(") || self.at(b">(")))) {
                 w.dynamic = true;
                 value.push(b'?');
@@ -648,5 +692,126 @@ mod tests {
         let order = trials.clone();
         trials.sort_by(f64::total_cmp);
         println!("18000 synthetic commands, ms: {order:?}; median {:.3}, range {:.3}..{:.3}", trials[2], trials[0], trials[4]);
+    }
+}
+
+#[cfg(test)]
+mod word_scan {
+    use super::*;
+
+    // The byte-at-a-time word scanner from v1.4.0.
+    impl<'a> Lexer<'a> {
+        fn word_inner_old(&mut self, expansions: bool) -> Word {
+            let start = self.pos;
+            let mut w = Word::default();
+            let mut value = Vec::new();
+            let mut quote = 0;
+            while self.pos < self.bytes.len() {
+                let c = self.bytes[self.pos];
+                if expansions && quote != b'\'' && (self.at(b"${") || (quote == 0 && (self.at(b"<(") || self.at(b">(")))) {
+                    w.dynamic = true;
+                    value.push(b'?');
+                    self.substitution();
+                    continue;
+                }
+                if quote == 0 && (c.is_ascii_whitespace() || b";&|(){}<>".contains(&c)) { break; }
+                if c == b'\\' && quote != b'\'' {
+                    w.quoted = true;
+                    self.pos += 1;
+                    if self.pos == self.bytes.len() { w.dynamic = true; break; }
+                    let next = self.bytes[self.pos];
+                    if quote == 0 || b"$`\"\\\n".contains(&next) {
+                        if next != b'\n' { value.push(next); }
+                        self.pos += 1;
+                    } else { value.push(c); }
+                } else if (c == b'\'' || c == b'"') && (quote == 0 || quote == c) {
+                    w.quoted = true;
+                    quote = if quote == 0 { c } else { 0 };
+                    self.pos += 1;
+                } else if expansions && quote != b'\'' && (self.at(b"$(") || c == b'`') {
+                    w.dynamic = true;
+                    value.push(b'?');
+                    self.substitution();
+                } else {
+                    // Expansion-produced executable names are unknowable without execution.
+                    if expansions && quote != b'\'' && c == b'$' { w.dynamic = true; }
+                    value.push(c);
+                    self.pos += 1;
+                }
+            }
+            if quote != 0 { w.dynamic = true; w.incomplete = true; } // Unfinished input never invents a name.
+            // Bash, Simple Command Expansion: quoting the assignment name makes it
+            // a command word; quoting only its value does not (A='x' cargo).
+            w.assignment = std::str::from_utf8(&self.bytes[start..self.pos]).ok().is_some_and(assignment);
+            w.text = String::from_utf8_lossy(&value).into_owned();
+            w
+        }
+    }
+
+    fn compare(command: &str, start: usize) {
+        for expansions in [false, true] {
+            let mut old = Lexer { bytes: command.as_bytes(), pos: start };
+            let mut new = Lexer { bytes: command.as_bytes(), pos: start };
+            let expected = old.word_inner_old(expansions);
+            let actual = new.word_inner(expansions);
+            let fields = |word: Word| {
+                (word.text, word.quoted, word.dynamic, word.assignment, word.incomplete)
+            };
+            assert_eq!(
+                (new.pos, fields(actual)), (old.pos, fields(expected)),
+                "command {command:?}, start {start}, expansions {expansions}",
+            );
+        }
+    }
+
+    #[test]
+    fn every_utf8_byte_pair_in_each_quote_state() {
+        let mut bytes = [0; 3];
+        for prefix in [None, Some(b'\''), Some(b'"')] {
+            bytes[0] = prefix.unwrap_or_default();
+            let offset = usize::from(prefix.is_none());
+            for first in 0..=u8::MAX {
+                bytes[1] = first;
+                for second in 0..=u8::MAX {
+                    bytes[2] = second;
+                    if let Ok(command) = std::str::from_utf8(&bytes[offset..]) {
+                        compare(command, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_utf8_commands_match_the_byte_at_a_time_scan() {
+        const PIECES: &[&str] = &[
+            "a", "git", "cargo", " ", "\t", "\n", "\x0c", "\r", ";", "&", "|", "(", ")", "{", "}",
+            "<", ">", "\\", "'", "\"", "`", "$", "${", "$(", "<(", ">(", "#", "=", "A=", "0",
+            "-c", "é", "😀", "<<", "EOF", "x/y", ".", "~", "$(cat <<EOF\né\nEOF\n)",
+        ];
+        // Xorshift64* with a fixed seed so failures can be reproduced.
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut below = |limit: usize| {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            ((seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as usize) % limit
+        };
+        let mut command = String::new();
+        for _ in 0..30_000 {
+            command.clear();
+            for _ in 0..below(18) {
+                if below(3) == 0 {
+                    command.push_str(PIECES[below(PIECES.len())]);
+                } else {
+                    for _ in 0..=below(8) {
+                        command.push(char::from(b'a' + below(26) as u8));
+                    }
+                }
+            }
+            for (start, _) in command.char_indices().take(24) {
+                compare(&command, start);
+            }
+        }
     }
 }

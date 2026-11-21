@@ -317,6 +317,7 @@ dependencies = [
  "flate2",
  "indexmap",
  "libc",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",

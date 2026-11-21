@@ -642,15 +642,17 @@ fn earlier_span(indices: &[usize], s: &State) -> String {
     }
 }
 fn earlier_tint(indices: &[usize], s: &State, p: &Palette) -> Option<u32> {
+    // Every agent folded into the row, on every frame: most share their neighbour's model.
+    let mut memo = terminal::FamilyMemo::default();
     let first = indices.first().map(|i| {
-        terminal::family(
+        memo.family(
             &s.snap.agents[*i].model,
             s.snap.agents[*i].provider_id.as_deref(),
         )
     })?;
     if first == terminal::ProviderFamily::Other
         || indices.iter().any(|i| {
-            terminal::family(
+            memo.family(
                 &s.snap.agents[*i].model,
                 s.snap.agents[*i].provider_id.as_deref(),
             ) != first
@@ -1218,6 +1220,9 @@ fn draw_list(
         );
         return by + 4;
     }
+    // `p.provider(a)` is the family color of `family(model, provider_id)`; a row asks for it up to
+    // three times, and neighbouring rows often share a model.
+    let mut families = terminal::FamilyMemo::default();
     for (n, r) in rows.iter().enumerate().skip(first).take(visible) {
         let a = &s.snap.agents[r.agent];
         let y = by + 1 + (n - first) as i32 * per as i32;
@@ -1434,7 +1439,7 @@ fn draw_list(
             }
             c.right(right, y, &meta, ink(p.dim));
             c.right(right, y, &age, age_color);
-            c.set(right - meta_w, y, '●', p.provider(a), Some(bg), false);
+            c.set(right - meta_w, y, '●', p.family_color(families.family(&a.model, a.provider_id.as_deref())), Some(bg), false);
             let shift = (r.depth as i32 - 2).max(0) * 2;
             let bx = xx + 6 + shift;
             let bw = (bar_w - shift).max(4);
@@ -1514,18 +1519,18 @@ fn draw_list(
                 xx + ww - 3 - width(&age),
                 y,
                 '●',
-                p.provider(a),
+                p.family_color(families.family(&a.model, a.provider_id.as_deref())),
                 Some(bg),
                 false,
             );
         }
         if lane_w >= 8 {
-            let tint = if terminal::family(&a.model, a.provider_id.as_deref())
+            let tint = if families.family(&a.model, a.provider_id.as_deref())
                 == terminal::ProviderFamily::Other
             {
                 None
             } else {
-                Some(p.provider(a))
+                Some(p.family_color(families.family(&a.model, a.provider_id.as_deref())))
             };
             lane(c, lane_x, y + per as i32 - 1, row_lane(n), max, p, bg, tint);
         }
@@ -1799,8 +1804,7 @@ pub fn draw_grid_reference(s: &State, w: usize, h: usize, p: &Palette) -> (Canva
 pub fn draw_grid(s: &State, w: usize, h: usize, p: &Palette) -> (Canvas, Surface) {
     let phase_start = std::time::Instant::now();
     let profiling = std::env::var_os("T3_FRAME_PROFILE").is_some();
-    let mut c = Canvas::new(w, h);
-    c.clear(p.bg, p.fg);
+    let mut c = Canvas::cleared(w, h, p.bg, p.fg);
     let mut frame = Surface::default();
     let ww = w as i32;
     let hh = h as i32;

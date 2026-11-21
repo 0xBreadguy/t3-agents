@@ -1,4 +1,6 @@
 [env]
 # libsqlite3-sys forwards these to bundled SQLite. Explicit build environment
 # overrides still take precedence and the cache checks for availability.
-LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_OFFSET_SQL_FUNC -DSQLITE_ENABLE_FILESTAT"
+# Disable allocation accounting by default and avoid the shared pcache1 mutex
+# across connections used by parallel report readers.
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_OFFSET_SQL_FUNC -DSQLITE_ENABLE_FILESTAT -DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT"
